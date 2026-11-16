@@ -1,3 +1,13 @@
+# 1.0.1 正式发布与 Latest 核验（2026-11-16）
+
+- `main` 与新标签 `v1.0.1` 已原子推送；构建 commit 为 `3c33ea2787fb1d1322e0a38ef75d2ce6c437baf8`。未移动或重写旧标签、远程历史。
+- Actions **43821344832** 全部成功：固定依赖、九组 C++ 测试、七个生产 TU、七项 Python 测试、Zig GNU DLL、独立 DLL/XLSX 检查、打包和正式发布。工作流使用 `--latest`，没有停留为草稿。
+- GitHub API 确认 Release 作者 github-actions[bot]、tag=v1.0.1、draft=false、prerelease=false，Latest API 指向 v1.0.1，ZIP/.sha256 两附件均为 uploaded。公开地址：https://github.com/Noplch0/ArkACT/releases/tag/v1.0.1 。
+- 重新下载正式附件核验 ZIP CRC、七文件允许清单、SHA256 文件、build-info 源 commit/DLL 大小与哈希；在独立检查进程加载 CI DLL，仅调用 query，确认版本 1.0.1、零前置插件依赖与禁用游戏写能力扫描通过。
+- **CI ZIP**：611,276 字节，SHA256 `50F305F2DBD2932FD23A59B1A28416189818FD7A50665E46AB7756C5C7CB6CA6`。**CI DLL**：1,416,192 字节，SHA256 `F9DB274F098BE0B32F02F3D541E22F9BDB166E10963907114FF9779B2C06AD89`。本地 DLL/ZIP 的哈希与 CI 不同，分别记录，不互相冒充。
+- 公开树与 Git 所有对象（含不可达 blob）、refs/reflog，以及远端分支/标签、历史/新 Actions 日志、Release 正文和重新下载的公开 ZIP 均已检查；未发现本机用户名、个人邮箱、私钥/令牌或实际游戏账户编号。旧 1.0.0 ZIP hash 仍为 `7654220C71882E5B15846AD61F2C6B1E7B5506A428AE1729FA62ABCBD9C4F1B7`，旧标签与附件未改变。本地忽略目录仍保留私有证据，不公开。
+- 本次收尾仅补录文档并推送 main，不再打标、不更换正式 Release 附件，未部署、热重载、附加、重启或关闭游戏。游戏内导出与联机实机验证边界保持不变。
+
 # 1.0.1 正式发布准备（2026-11-16）
 
 - 用户授权推送并直接作为 Latest Release 发布。工作流显示名改为 Release，保留历史路径；只有所有验证和打包步骤通过才调用 `gh release create --verify-tag --latest`，不保留为草稿或预发布。
