@@ -138,7 +138,7 @@ third_party/il2cpp-mod-template/platform/il2cpp_module_windows.c
 ### 4.3 公开仓库与 Release draft
 
 - 仓库为 git@github.com:Noplch0/ArkACT.git，默认分支 main；首次公开版本 1.0.0 对应标签 v1.0.0。不重写已有远程历史、不移动已发布标签。
-- .github/workflows/release-draft.yml 监听 v* 标签，也支持 workflow_dispatch 的既有 tag；标签必须与版本头一致并指向构建 commit。固定第三方 Actions commit，Windows runner 自动发现工具链。
+- .github/workflows/release-draft.yml 监听 v* 标签，也支持 workflow_dispatch 的既有 tag；标签必须与版本头一致并指向构建 commit。固定第三方 Actions commit，Windows runner 自动发现工具链，并设置 PYTHONUTF8=1，避免英文 runner 打印中文 Sheet 名时因 cp1252 中断。
 - 流程：锁定依赖 -> 九组测试/七个 TU -> Zig GNU x64 DLL -> inspect_binary/inspect_workbook -> tools/package-release.ps1 -> gh 创建/更新 **draft**。失败不创建草稿；已有正式 Release 拒绝覆盖。需要该 job 的 contents:write 权限，不需要额外个人 token secret。
 - 发布附件只有 ArkACT-v<版本>-windows-x64.zip 与 .sha256。ZIP 含 plugins/stronghold_stats.dll、部署/README、GPL 与精简后端 MIT 许可及 build-info.json（源码 commit、依赖、DLL hash/大小）；不捆绑 ArkImGui/宿主/注入器。DLL 的最终哈希以附件 build-info 和校验和为准，不把本机旧 DLL 哈希写成 CI 哈希。
 - .gitignore 排除 .build、.tools、原始 reference、真实诊断、导出报表和 dist 二进制。公开测试仅使用 tests/fixtures 的元数据声明/显式静态补充，不含运行态快照、UID、昵称值或游戏模块。参考源码需要时按上游固定 commit 另取；不把用户教程或完整 dump 推上仓库。
@@ -537,3 +537,4 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 | 2026-11-15 | 2.1.2：修复非空失效来源回退；动态/嵌套召唤物刷新、同轮迟到效果身份与覆盖集合分离；来源 side 唯一验证；无来源/环境 Enemy 承伤单列未知，不伪造玩家；补源类诊断、ABI/模型/报表回归；复核后拦截 Enemy 直接来源被友方原来源重标；同步正文适配步骤。 | 修复前来源回归实际红灯，修复后九组 MSVC 测试/七个 TU、Zig GNU DLL、query 2.1.2 零前置插件依赖/禁用写 API 扫描、XLSX 独立检查通过；模型18项、CSV6组、XLSX4组。本轮仅构建项目 dist，未部署/重载/操作游戏；具体盟约/干员与非 Enemy 目标边界待局内验证。 |
 
 | 2026-11-16 | 首次公开发布重标 1.0.0，保留原内部 2.1.2 采集功能；初始化 GitHub main 发布路径、固定 Zig/ArkFramework 依赖与 ArkImGui 准备脚本，新增标签触发且只建 draft 的 Actions；构建脚本支持 ImGuiDir，验证自动发现 MSVC/SDK。公开回归改用元数据声明子集，排除原始报告、完整 reference 和本地二进制；补 GPL/MIT 许可及打包清单。 | 本地依赖准备、九组 MSVC 测试与七个 TU 检查已通过；抽取夹具首次缺 DamageType enum 导致 ABI 测试红灯，补回真实声明后通过。Zig 0.17.0 构建、独立 DLL query 1.0.0/零前置插件依赖/禁用写 API 扫描、XLSX 独立检查及 actionlint 1.7.12 已通过；本地 DLL 1,416,704 字节，SHA256 7B950E9067AFD47C74AC04FB41A2499CE74C50037844D3DDA9EDB1AAFCAAA338。远程 Actions/草稿结果将在观察后另记；未操作游戏，实机验收边界未改变。 |
+| 2026-11-16 | 首次推送 main/v1.0.0（9fbf0c4），本地发布 ZIP 允许清单/CRC/build-info/hash 校验通过。远程首次 Actions 已通过九组测试、七个 TU、Zig 构建和 DLL query；XLSX 校验打印中文时遭 cp1252 编码错误，未创建草稿。修复工作流 PYTHONUTF8=1，保持已推送标签不动，由 main 的 workflow_dispatch 构建既有 v1.0.0。 | 该修复只改变 CI 环境，不改已打标源码或插件行为；Windows runner 的中文日志问题不得误判为 XLSX 数据损坏。重新运行与草稿观察结果完成后另记。 |
