@@ -63,7 +63,7 @@
 | `build-plugin.ps1` / `verify.ps1` | 发布构建 / MSVC 测试及七个生产源文件编译检查；支持可移植路径与自动发现 |
 | `tools/dependencies.lock.json` / `prepare-dependencies.ps1` / `package-release.ps1` | 固定工具链/ArkImGui 来源、干净检出准备与不捆绑宿主的发布包 |
 | `.github/workflows/release-draft.yml` | 标签校验、验证/构建、仅创建 Release 草稿 |
-| `README.md` / `AUDIT.md` / `dist/部署说明.txt` | 用户文档 / 历史修复证据 / 部署说明，改功能须同步 |
+| `README.md` / `AUDIT.md` / `dist/部署说明.txt` | 面向用户的安装、操作、口径、导出与排障入口 / 历史修复证据 / 部署说明；源码构建、Actions 和升级适配细节由本文承载，改功能须同步相应文档 |
 
 ## 4. 从零准备与构建
 
@@ -111,7 +111,7 @@ Get-Item 'dist\plugins\stronghold_stats.dll'
 Get-FileHash 'dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 ```
 
-脚本真实参数为 `-Zig`、`-DistDirectory`、`-ArkImGuiImportLibrary`、`-ImGuiDir`。指定其他输出目录时，也要提供对应导入库，或用 `-ArkImGuiImportLibrary` 显式指定。Zig 查找顺序含显式参数、项目 `.tools`、PATH 和 WinGet 路径。历史构建实测过 Zig 0.17.0，README 曾推荐 0.15.2；换版本必须重跑验证，不保证所有 Zig 版本兼容。
+脚本真实参数为 `-Zig`、`-DistDirectory`、`-ArkImGuiImportLibrary`、`-ImGuiDir`。指定其他输出目录时，也要提供对应导入库，或用 `-ArkImGuiImportLibrary` 显式指定。Zig 查找顺序含显式参数、项目 `.tools`、PATH 和 WinGet 路径。历史构建实测过 Zig 0.17.0；换版本必须重跑验证，不保证所有 Zig 版本兼容。用户 README 不再承担构建说明。
 
 发布构建的七个 translation unit：
 
@@ -539,3 +539,4 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 | 2026-11-16 | 首次公开发布重标 1.0.0，保留原内部 2.1.2 采集功能；初始化 GitHub main 发布路径、固定 Zig/ArkFramework 依赖与 ArkImGui 准备脚本，新增标签触发且只建 draft 的 Actions；构建脚本支持 ImGuiDir，验证自动发现 MSVC/SDK。公开回归改用元数据声明子集，排除原始报告、完整 reference 和本地二进制；补 GPL/MIT 许可及打包清单。 | 本地依赖准备、九组 MSVC 测试与七个 TU 检查已通过；抽取夹具首次缺 DamageType enum 导致 ABI 测试红灯，补回真实声明后通过。Zig 0.17.0 构建、独立 DLL query 1.0.0/零前置插件依赖/禁用写 API 扫描、XLSX 独立检查及 actionlint 1.7.12 已通过；本地 DLL 1,416,704 字节，SHA256 7B950E9067AFD47C74AC04FB41A2499CE74C50037844D3DDA9EDB1AAFCAAA338。远程 Actions/草稿结果将在观察后另记；未操作游戏，实机验收边界未改变。 |
 | 2026-11-16 | 首次推送 main/v1.0.0（9fbf0c4），本地发布 ZIP 允许清单/CRC/build-info/hash 校验通过。远程首次 Actions 已通过九组测试、七个 TU、Zig 构建和 DLL query；XLSX 校验打印中文时遭 cp1252 编码错误，未创建草稿。修复工作流 PYTHONUTF8=1，保持已推送标签不动，由 main 的 workflow_dispatch 构建既有 v1.0.0。 | 该修复只改变 CI 环境，不改已打标源码或插件行为；Windows runner 的中文日志问题不得误判为 XLSX 数据损坏。重新运行与草稿观察结果完成后另记。 |
 | 2026-11-16 | 1.0.0 远程交付收尾：main 的 UTF-8 修正工作流 43812543420 成功，构建固定 v1.0.0/9fbf0c4；github-actions[bot] 创建单一 draft，标签未移动，未正式发布。同步记录实际附件及只读边界。 | 远程九组测试、七个 TU、Zig 构建、DLL/XLSX 检查和打包均成功；认证 API 确认 draft=true 与 ZIP/.sha256 两附件。重新下载验证 ZIP 允许清单/CRC/清单 commit/哈希，实际加载 CI DLL query=1.0.0、零前置插件依赖、禁用写能力扫描通过。CI DLL 1,416,704 字节，SHA256 C6B08FA21D52D3137D25A51179D05EC1C460680FCA177CF95DF34405F74676C2；ZIP SHA256 7654220c71882e5b15846ad61f2c6b1e7b5506a428ae1729fa62abcbd9c4f1b7。Node20 Actions 被 runner 自动转为 Node24，仅弃用告警、未失败；后续升级固定 Actions 版本需重验。未操作游戏，联机实机项仍待用户验证。 |
+| 2026-11-16 | 将 README 全面重写为面向用户的文档：以功能、前置条件、安装更新、界面操作、统计口径、XLSX、常见排障、卸载和只读边界组织内容；移除 IL2CPP 入口、历史版本修复、构建和 Actions 维护细节，这些仍由 AGENTS/AUDIT 保存。同步源码地图与 Zig 构建说明；插件代码、版本、标签和 Release 状态不变。 | 按生产 UI 控件、报表路径和当前 1.0.0 元数据复核文档，执行 UTF-8、Markdown 本地链接及变更范围静态检查；仅文档更新，不重复运行编译/业务测试，未部署、重载或操作游戏。既有联机与具体盟约/干员实机验收边界不变。 |
