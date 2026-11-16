@@ -2,7 +2,7 @@
 
 基于 [ArkFramework](https://github.com/wuyu8512/ArkFramework) 的插件，仅适配《明日方舟》PC 端「卫戍协议」模式。
 
-当前发布版本：**1.0.0**。这是首次公开仓库发布的版本重标，保留此前内部 2.1.2 的完整功能和修复，并非回退实现；历史审计记录中的 2.x 编号保留用于追溯。
+当前发布版本：**1.0.0**（[Release 草稿](https://github.com/Noplch0/ArkACT/releases)，需仓库协作者登录查看）。这是首次公开仓库发布的版本重标，保留此前内部 2.1.2 的完整功能和修复，并非回退实现；历史审计记录中的 2.x 编号保留用于追溯。
 
 插件直接通过 ArkFramework 原生 Hook 读取已应用的伤害与战斗日志，不再依赖或消费 `ark.battle.events`，因此不需要 `damage_meter.dll`、`buff_capture.dll` 或任何增益扩展。旧 `operator_stats.dll` 与本插件不要同时部署，避免重复统计。
 

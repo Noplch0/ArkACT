@@ -16,6 +16,16 @@ main 和 v1.0.0 已推送，标签对应 9fbf0c4。Actions 43811914402 已完成
 
 工作流明确设置 PYTHONUTF8=1；不移动或强推已存在的 v1.0.0，使用 main 上修正后的 workflow_dispatch 构建该固定标签。该配置修正不影响标签所指的插件源码、计量或只读边界，重新运行结果另记。
 
+## 最终远程验收
+
+- Actions **43812543420** 成功（workflow_dispatch 从 main 的修正配置运行，checkout 固定 v1.0.0/9fbf0c4），包含九组回归、七个生产 TU、依赖/GNU DLL 构建、DLL query、XLSX 独立检查、打包与 draft 创建。未移动已推送标签，未强推。
+- 认证 API 核实 Release 作者 github-actions[bot]、tag=v1.0.0、draft=true、两附件均 uploaded。没有正式发布。草稿页面：https://github.com/Noplch0/ArkACT/releases/tag/untagged-6a4317b00941312cba7e （需仓库协作者登录）。
+- 实际下载 CI 附件，独立校验 ZIP 允许清单/CRC、SHA256 文件和 build-info 的源码 commit/DLL hash；用本机匹配 ArkImGui 在独立 Python 进程加载该 DLL，只调用 query，版本 1.0.0、零前置插件依赖及禁用写 API 扫描均通过。
+- CI DLL：1,416,704 字节，SHA256 **C6B08FA21D52D3137D25A51179D05EC1C460680FCA177CF95DF34405F74676C2**。
+- CI ZIP：615,502 字节，SHA256 **7654220c71882e5b15846ad61f2c6b1e7b5506a428ae1729fa62abcbd9c4f1b7**。完整源码 commit：9fbf0c4a204dfad4af4caff3f7c6b986f8939473。
+- 本地 DLL 与 CI DLL hash 不同，不能互相冒充；发布使用 CI build-info 和附件校验和。草稿仅创建未发布，不承诺匿名可下载。
+- Runner 对固定的 Node20 Actions 给出弃用告警并自动转 Node24，未导致失败；未来更新依赖 Actions 要重新验证。未增加实机验收结论，未操作游戏或覆盖正在运行的插件。
+
 # 2.1.2 盟约附加伤害、无来源承伤与动态召唤物（2026-11-15）
 
 ## 已证实的根因与修复
