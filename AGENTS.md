@@ -2,7 +2,7 @@
 
 本文件面向继续开发本仓库的 agent。目标不仅是说明如何编译现有代码，还要保存足以重新实现插件的架构、数据语义、已验证入口、失败经验和游戏更新适配方法。
 
-- 文档基线：2026-11-15，源码版本 `common/stronghold_version.h` 中的 **2.1.2**。
+- 文档基线：2026-11-16，源码版本 `common/stronghold_version.h` 中的 **1.0.1**（原内部 2.1.2 采集基线）。
 - 源码、当前客户端元数据及可复现测试优先于本文中的历史快照。更新实现后必须同步本文件，不能为了符合旧文档强行恢复旧结构。
 - 产品：仅适用于《明日方舟》卫戍协议的只读统计插件；支持 1–4 人本地模拟数据，不是通用伤害插件、独立注入器或游戏修改器。
 - 这份文档不代表已完成所有实机验收，尤其不能把模拟测试通过等同于当前游戏版本联机实测通过。产品契约是维护目标，不应误读成所有防护已经完备；当前实现的明确边界见第 9.1 节。
@@ -60,9 +60,10 @@
 | `tests/` | 九组纯逻辑、模拟元数据和 ImGui 回归测试 |
 | `tools/inspect_binary.py` | PE/导出/依赖/旧功能及禁用写能力检查，含实际加载 query 检查 |
 | `tools/inspect_workbook.py` | 不依赖插件生成器的独立 ZIP/XML/XLSX 内容校验 |
+| `tests/test_inspect_workbook.py` / `tools/test-excel-workbook.ps1` | 独立校验器的匿名元数据反例；可选的已安装 Excel 原生只读打开检查 |
 | `build-plugin.ps1` / `verify.ps1` | 发布构建 / MSVC 测试及七个生产源文件编译检查；支持可移植路径与自动发现 |
 | `tools/dependencies.lock.json` / `prepare-dependencies.ps1` / `package-release.ps1` | 固定工具链/ArkImGui 来源、干净检出准备与不捆绑宿主的发布包 |
-| `.github/workflows/release-draft.yml` | 标签校验、验证/构建、仅创建 Release 草稿 |
+| `.github/workflows/release-draft.yml` | 历史文件名保留；标签校验、验证/构建、正式发布并核验 Latest |
 | `README.md` / `AUDIT.md` / `dist/部署说明.txt` | 面向用户的安装、操作、口径、导出与排障入口 / 历史修复证据 / 部署说明；源码构建、Actions 和升级适配细节由本文承载，改功能须同步相应文档 |
 
 ## 4. 从零准备与构建
@@ -135,14 +136,14 @@ third_party/il2cpp-mod-template/platform/il2cpp_module_windows.c
 
 包含 `include`、匹配 ImGui、`stronghold`、`common`、`diagnostics` 和精简第三方后端目录；最终 `-shared`，链接匹配的 `libArkImGui.dll.a` 与 `-luser32`。不要在插件内再编一套生产 ImGui。
 
-### 4.3 公开仓库与 Release draft
+### 4.3 公开仓库与 Release 流程
 
-- 仓库为 git@github.com:Noplch0/ArkACT.git，默认分支 main；首次公开版本 1.0.0 对应标签 v1.0.0。不重写已有远程历史、不移动已发布标签。
-- .github/workflows/release-draft.yml 监听 v* 标签，也支持 workflow_dispatch 的既有 tag；标签必须与版本头一致并指向构建 commit。固定第三方 Actions commit，Windows runner 自动发现工具链，并设置 PYTHONUTF8=1，避免英文 runner 打印中文 Sheet 名时因 cp1252 中断。
-- 流程：锁定依赖 -> 九组测试/七个 TU -> Zig GNU x64 DLL -> inspect_binary/inspect_workbook -> tools/package-release.ps1 -> gh 创建/更新 **draft**。验证/构建失败不进入创建步骤；已有正式 Release 拒绝覆盖。上传失败可能留下未完成草稿，必须检查并重跑，不宣称成功。需要该 job 的 contents:write 权限，不需要额外个人 token secret。
+- 仓库为 git@github.com:Noplch0/ArkACT.git，默认分支 main；首次公开版本 1.0.0 对应标签 v1.0.0，已于 2026-11-16 正式公开发布。不重写已有远程历史、不移动已发布标签。
+- .github/workflows/release-draft.yml 保留历史文件名，显示名为 Release，监听 v* 标签，也支持 workflow_dispatch 的既有 tag；标签必须与版本头一致并指向构建 commit。固定第三方 Actions commit，Windows runner 自动发现工具链，并设置 PYTHONUTF8=1，避免英文 runner 打印中文 Sheet 名时因 cp1252 中断。
+- 用户于 2026-11-16 授权从 1.0.1 起不再停留为草稿，而是在验证通过后直接正式发布并设为 Latest。流程：锁定依赖 -> 九组测试/七个 TU -> Zig GNU x64 DLL -> inspect_binary/七项 Python/inspect_workbook -> tools/package-release.ps1 -> `gh release create --verify-tag --latest`。不带 `--draft`/`--prerelease`；验证/构建失败不进入发布步骤，已有同标签 Release（含残留草稿）拒绝覆盖，应先检查状态再决定恢复，不自动重传/替换正式附件。CLI 上传失败可能留下未完成 Release，必须检查，不盲目重跑或宣称成功。需要该 job 的 contents:write 权限，不需要额外个人 token secret。
 - 发布附件只有 ArkACT-v<版本>-windows-x64.zip 与 .sha256。ZIP 含 plugins/stronghold_stats.dll、部署/README、GPL 与精简后端 MIT 许可及 build-info.json（源码 commit、依赖、DLL hash/大小）；不捆绑 ArkImGui/宿主/注入器。DLL 的最终哈希以附件 build-info 和校验和为准，不把本机旧 DLL 哈希写成 CI 哈希。
 - .gitignore 排除 .build、.tools、原始 reference、真实诊断、导出报表和 dist 二进制。公开测试仅使用 tests/fixtures 的元数据声明/显式静态补充，不含运行态快照、UID、昵称值或游戏模块。参考源码需要时按上游固定 commit 另取；不把用户教程或完整 dump 推上仓库。
-- 发布前实际审查暂存文件及账号隐私，使用 GitHub noreply 提交身份。推送 main 和版本标签后必须观察 Actions 结果，并通过认证 API 确认 draft=true、标签与两个附件；不能只提交 YAML 就宣称 Release 已完成。草稿需协作者登录，不能承诺匿名可见。
+- 发布前实际审查暂存文件及账号隐私，使用 GitHub noreply 提交身份。隐私审计必须覆盖当前树、全部 reachable/unreachable Git blob、refs/reflog、远端分支与标签、Actions 日志、Release 正文和公开附件；公开内容不应含游戏 UID、昵称编号、私钥/令牌、个人邮箱或本机 Windows 用户名。`.build`、`.tools`、`reference` 和 PDB/导出报表即使被 Git 忽略，仍可能残留本机路径、会话哈希或玩家显示名，分享整个工作目录前必须另行排除或脱敏。推送 main 和版本标签后必须观察 Actions 结果；确认 draft=false、prerelease=false、标签和两个附件正确，且 `/releases/latest` 指向目标标签；重新下载校验 ZIP/清单/哈希，不能只提交 YAML 就宣称 Release 已完成。
 - 本次版本重标不改变采集、归属、时钟、导出与只读玩法边界；内部 2.x 审计保留原编号。离线/CI 通过仍不代表联机实测通过。
 
 ### 4.4 宿主 ABI 与生命周期
@@ -291,6 +292,8 @@ Modifier.source / originalSource
 - 完整结束后用**结束时的本机本地时间**命名 `yyyy-MM-dd HH-mm.xlsx`，例如 `2026-11-14 19-30.xlsx`（Windows 文件名不能用冒号）。同分钟冲突添加 `(2)` 等后缀，不覆盖其他对局。
 - 进行中或中断使用含 pid/session 的备用名称，不冒充正常整局结束时间；导出失败保留快照以便重试，重试应保留原来锁定的结束时间，通过临时文件/原子替换避免半写文件。
 - XLSX 实现是自包含 ZIP store + CRC32 + OOXML，无压缩库/Office/外部报表运行时依赖；改生成器时要同步独立解析检查，不仅测试“文件存在”。
+- **Excel 工作簿属性兼容性（1.0.1）**：`make_workbook_xml()` 不写可选 `fileVersion`。旧 `<fileVersion appName="xl"/>` 虽能通过 XML/ZIP 校验，却会让 Excel 16.0（本机 build 20527）正常打开失败，交互打开提示修复 `/xl/workbook.xml` 工作簿属性。保留实际 `workbookPr`、视图、Sheet、样式与数值；不要为修复它删除数据、隐藏警告或请求 Excel 自动修复。导出器不是 Excel，不伪造 Excel 编辑版本。独立检查器的受支持产物策略允许省略该元素；若存在，只接受同命名空间、直属且完整的已验证 Excel 版本属性组（`appName=xl` 与数值 `lastEdited/lowestEdited/rupBuild`），这不是完整 OOXML Schema 验证器。
+- XLSX 兼容性修复只影响新导出/重新导出文件，不自动扫描或重写用户旧报表。原始报表、真实玩家信息和本地复现副本不进入 Git。原生 Excel 检查仅是开发机的可选验证，不成为插件运行或无 Excel CI 的依赖；也不代表游戏实机验收。
 
 ## 6. 游戏更新后的适配流程
 
@@ -410,7 +413,7 @@ Select-String -Path 'stronghold\capture.cpp' `
 | 切历史后马上跳回当前 | ViewSelection 是否被 RoundStart 重置 | 改游戏 currentRound 来切界面 |
 | 局外看不到刚结束数据 | 窗口可见性与 Manager 生存周期是否耦合 | 把残留游戏指针缓存到局外继续读 |
 | 表格底部大片空白/内容被挡 | ImGui 剩余高度、child/表格滚动与 popup 布局 | 隐藏数据行或固定极小显示人数 |
-| XLSX 有文件但打不开/占比无百分号 | ZIP CRC、OOXML rels、XML 转义、数值与百分比 style、原子替换 | 把 CSV 重命名为 xlsx，或用文本占比掩盖数据类型错误 |
+| XLSX 有文件但打不开/Excel 修复工作簿属性/占比无百分号 | ZIP CRC、OOXML rels、XML 转义、数值与百分比 style、原子替换；`workbook.xml` 是否恢复了不完整的 `fileVersion appName=xl` | 只凭 XML 可解析就宣称 Excel 兼容；把 CSV 重命名为 xlsx、强制 Excel 修复或用文本占比掩盖错误 |
 
 ### 6.7 保存新证据并收敛适配
 
@@ -441,8 +444,16 @@ python '.\tools\inspect_binary.py' '.\dist\plugins\stronghold_stats.dll'
 if ($LASTEXITCODE -ne 0) { throw 'binary inspection failed' }
 
 # verify 的 XLSX 测试会生成这个固定夹具。名称虽含2.1.0，仍是当前测试输出路径。
+python -B -m unittest discover -s tests -p 'test_inspect_workbook.py'
+if ($LASTEXITCODE -ne 0) { throw 'workbook inspector regression failed' }
+
 python '.\tools\inspect_workbook.py' '.\.build\export-2.1.0-fixture\exports\报告.xlsx'
 if ($LASTEXITCODE -ne 0) { throw 'workbook inspection failed' }
+
+# 可选：仅在已安装 Excel 的 Windows 开发机运行；创建独立实例、禁宏/事件/链接，
+# 以 xlNormalLoad 默认模式只读打开，不请求修复、不保存，也不连接用户已有 Excel。
+& '.\tools\test-excel-workbook.ps1'
+# 可用 -Path 显式指定一个或多个本地测试文件；CI/插件运行不要求安装 Excel。
 
 Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 ```
@@ -462,10 +473,12 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 | `metadata_report_tests.cpp` | mock GameAssembly 导出解析、报告完整性/兼容性与隐私边界，不加载真实游戏 |
 | `stronghold_ui_tests.cpp` | ImGui 实际按钮/布局、选择生命周期、阶段成员、局外可见、历史与滚动 |
 | `stronghold_csv_tests.cpp` | 共用行语义、兼容 CSV 转义/中文/零分母、隐私列等回归 |
-| `stronghold_xlsx_tests.cpp` | ZIP/CRC32、OOXML、多 Sheet、15 列、中文、百分比、文本安全、原子写入/失败 |
+| `stronghold_xlsx_tests.cpp` | ZIP/CRC32、OOXML、多 Sheet、15 列、中文、百分比、文本安全、原子写入/失败；不生成使 Excel 修复的应用版本记录 |
 | `stronghold_report_tests.cpp` | 多轮归档、结束时间固定、同分钟冲突、进行中/中断、失败保留重试与默认写入器集成 |
 
 `verify.ps1` 还会编译全部七个生产源文件。UI 测试单独编译测试版 ImGui 是测试机制，不应照搬为发布插件内置另一套 ImGui。测试不能依赖游戏正在运行，也不能通过启动/关闭真实游戏获得绿灯。
+
+另外 `tests/test_inspect_workbook.py` 的七项标准库单元测试使用匿名临时 ZIP，保护元数据校验器本身；`inspect_workbook.py` 先检查工作簿元数据再解析 Sheet。该测试已接入 Release draft 的独立检查步骤，不改变 `verify.ps1` 的九组 C++ 测试数量。Excel 原生打开检查不能用自动修复模式代替；正例须正常打开，历史错误负例须失败，不能仅凭普通 XML parser 通过判断兼容。
 
 ### 7.3 每次兼容修复至少增加的反证测试
 
@@ -474,7 +487,7 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 - 模式：endingStatus 非零但仍战斗；局外 Manager 为 null；同局跨轮不清总量，名单退出不误开新局，真正新 session 清旧局。
 - 计时：四人中先结束一人的主战时间冻结，队友继续；等待后协防 1–2 人单计；名单不明有警告；掉线/淘汰/未知状态不造计时。
 - 轮次/UI：raw 0->1 不换轮；正 8 显示 8；历史固定、当前跟随、整局/本轮 × 战斗/协防四种组合；局外保留一局；长表可滚动且底部无挡板。
-- 报表：完整整局+每轮、两阶段、有限数值、零分母、昵称括号状态、百分比样式、无账户标识/干员 ID、中文/特殊字符/以等号开头的文本安全。
+- 报表：完整整局+每轮、两阶段、有限数值、零分母、昵称括号状态、百分比样式、无账户标识/干员 ID、中文/特殊字符/以等号开头的文本安全；不完整 Excel fileVersion 必须被独立检查拒绝，有 Excel 时核对正常打开而非修复打开。
 - 生命周期：手动 reset 请求失败不吞；Hook 移除失败不释放状态；归档失败卸载延期且再次请求可重试，不能依赖已移除的帧回调。
 
 ### 7.4 实机验收矩阵（由用户安排时机）
@@ -540,3 +553,7 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 | 2026-11-16 | 首次推送 main/v1.0.0（9fbf0c4），本地发布 ZIP 允许清单/CRC/build-info/hash 校验通过。远程首次 Actions 已通过九组测试、七个 TU、Zig 构建和 DLL query；XLSX 校验打印中文时遭 cp1252 编码错误，未创建草稿。修复工作流 PYTHONUTF8=1，保持已推送标签不动，由 main 的 workflow_dispatch 构建既有 v1.0.0。 | 该修复只改变 CI 环境，不改已打标源码或插件行为；Windows runner 的中文日志问题不得误判为 XLSX 数据损坏。重新运行与草稿观察结果完成后另记。 |
 | 2026-11-16 | 1.0.0 远程交付收尾：main 的 UTF-8 修正工作流 43812543420 成功，构建固定 v1.0.0/9fbf0c4；github-actions[bot] 创建单一 draft，标签未移动，未正式发布。同步记录实际附件及只读边界。 | 远程九组测试、七个 TU、Zig 构建、DLL/XLSX 检查和打包均成功；认证 API 确认 draft=true 与 ZIP/.sha256 两附件。重新下载验证 ZIP 允许清单/CRC/清单 commit/哈希，实际加载 CI DLL query=1.0.0、零前置插件依赖、禁用写能力扫描通过。CI DLL 1,416,704 字节，SHA256 C6B08FA21D52D3137D25A51179D05EC1C460680FCA177CF95DF34405F74676C2；ZIP SHA256 7654220c71882e5b15846ad61f2c6b1e7b5506a428ae1729fa62abcbd9c4f1b7。Node20 Actions 被 runner 自动转为 Node24，仅弃用告警、未失败；后续升级固定 Actions 版本需重验。未操作游戏，联机实机项仍待用户验证。 |
 | 2026-11-16 | 将 README 全面重写为面向用户的文档：以功能、前置条件、安装更新、界面操作、统计口径、XLSX、常见排障、卸载和只读边界组织内容；移除 IL2CPP 入口、历史版本修复、构建和 Actions 维护细节，这些仍由 AGENTS/AUDIT 保存。同步源码地图与 Zig 构建说明；插件代码、版本、标签和 Release 状态不变。 | 按生产 UI 控件、报表路径和当前 1.0.0 元数据复核文档，执行 UTF-8、Markdown 本地链接及变更范围静态检查；仅文档更新，不重复运行编译/业务测试，未部署、重载或操作游戏。既有联机与具体盟约/干员实机验收边界不变。 |
+| 2026-11-16 | 1.0.1：定位 Excel 修复工作簿属性为不完整 `fileVersion appName=xl`，生成器省略可选版本声明；加入 C++ 红灯回归、独立校验器七项匿名测试和 CI 检查，可选 Excel 原生正常只读打开脚本。同步导出兼容性、排障/验证步骤、README、部署说明和 AUDIT。 | 修复前 C++ 回归及 Excel 正常打开均失败；修复后九组 MSVC/七个 TU、七项 Python、独立 XLSX、Zig 构建、实际 DLL query=1.0.1/零前置插件依赖/禁用写 API 检查通过。Excel 16.0 build 20527 正常打开四 Sheet 生产夹具及十六 Sheet 最小修复对照，原错误负例拒绝；原报表 hash 与所有 Sheet 数据/样式保持不变。DLL 1,416,192 字节，SHA256 FA21A9AB3A2851431AEB403033CF16B70F76061F8D8D69A31D7B9E5B4E988197。本轮未推送/打标/更新 Release，未部署、重载或操作游戏；旧报表不自动改写，游戏内导出仍待用户安排验证。 |
+| 2026-11-16 | 脱敏隐私审计：审计开始时 59 个跟踪文件、97 个 Git 对象（含 4 个不可达 blob），并补扫审计期间出现的未提交 1.0.1 改动；核对 refs/reflog、远端 main/tag、两条 Actions 日志、Release 正文与公开 ZIP。公开树、历史及发布附件未发现游戏 UID、昵称编号、私钥/令牌、个人邮箱或本机 Windows 用户名；公开身份只有仓库所属 GitHub 账号及 noreply 提交/标签身份。同步修正 v1.0.0 已正式公开的状态，并补充本地忽略目录的隐私边界。 | 公开 Release ZIP 615,502 字节，SHA256 `7654220C71882E5B15846AD61F2C6B1E7B5506A428AE1729FA62ABCBD9C4F1B7`，重新下载后未含本机用户路径、PDB 或游戏账号字段；Actions 日志无本机用户路径，GitHub secret-scanning alerts=0，代码扫描未配置。本机忽略目录仍存有 `dist`/`.build` PDB 与日志中的 Windows 用户路径、`reference/current-schema` 的运行态会话哈希，以及 `.build/xlsx-excel-repro` 中 4 个疑似真实玩家显示名；这些内容未进入 Git、远端或 Release，本轮未清理。未提供明文 UID/昵称作精确比对，短昵称结论仍依赖账户字段、长数字、本地隔离和已知标记；未编译/测试、未部署/重载或操作游戏。 |
+| 2026-11-16 | 复核 GitHub 公开可见性口径，已复核，无技术变更：公开仓库与公开 Release 的既有脱敏审计结论仍适用，未发现游戏 UID、昵称编号、个人邮箱、令牌或本机 Windows 用户名；公开的 GitHub 账号用户名及 noreply 提交/标签身份属于预期元数据。 | 本次仅解释既有审计边界，未重新联网复核远端、未编译/测试、未修改生产源码或产物、未部署/重载或操作游戏。本地忽略目录中的 PDB、日志、会话哈希和 XLSX 玩家显示名仍只在本地，分享整个工作目录前需排除。 |
+| 2026-11-16 | 按用户授权将 1.0.1 发布流程从仅建草稿改为正式 Release/Latest，保留工作流文件名，加入发布后标签、附件名、公开状态及 Latest API 核验；更新发布说明与部署文档，准备提交既有 Excel 兼容性修复。 | 本轮 actionlint 1.7.12、七项 Python 回归、XLSX 独立校验、实际 DLL query=1.0.1/零前置插件依赖检查通过；本机临时目录测试需在沙箱外执行，权限恢复后通过，未改业务测试。公开树与全部 97 个 Git 对象（71 个 blob，含不可达内容）、refs/reflog 规则扫描通过；远端 main 与本地基线一致，v1.0.1 尚未存在。正式发布及远端 CI/附件核验在观察后另记；未操作游戏或部署。 |

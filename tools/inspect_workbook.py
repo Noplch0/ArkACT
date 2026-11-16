@@ -1,4 +1,10 @@
-"""Independently validate the plugin's generated XLSX using the standard library."""
+"""Independently validate the plugin's generated XLSX using the standard library.
+
+This plugin-output validation profile accepts an omitted ``fileVersion`` or
+the complete Excel compatibility tuple tested by the project. It is not a
+general OOXML schema validator. The historical ``appName="xl"``-only declaration
+is rejected before worksheet content is inspected.
+"""
 from pathlib import Path
 from zipfile import ZipFile
 import math
@@ -8,16 +14,66 @@ import xml.etree.ElementTree as ET
 
 NS = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
       'r': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+FILE_VERSION_ATTRIBUTES = frozenset(('appName', 'lastEdited', 'lowestEdited', 'rupBuild'))
 HEADERS = ['阶段', '维度', '轮次', '玩家槽位', '玩家', '干员', '实例数', '实际伤害',
            '战斗时间(秒)', 'DPS', '伤害占比', '计算伤害', '治疗量', 'HPS', '元素损伤']
+
+
+def _local_name(tag):
+    return tag.rsplit('}', 1)[-1]
+
+
+def _validate_workbook_metadata(workbook):
+    workbook_tag = f'{{{NS["s"]}}}workbook'
+    assert workbook.tag == workbook_tag, (
+        f'workbook root must be {workbook_tag}, got {workbook.tag}')
+
+    file_versions = [element for element in workbook.iter()
+                     if _local_name(element.tag) == 'fileVersion']
+    assert len(file_versions) <= 1, 'workbook contains duplicate <fileVersion> elements'
+    if not file_versions:
+        return
+
+    file_version = file_versions[0]
+    file_version_tag = f'{{{NS["s"]}}}fileVersion'
+    assert file_version.tag == file_version_tag, (
+        f'<fileVersion> must use the SpreadsheetML namespace {NS["s"]}, '
+        f'got {file_version.tag}')
+    assert any(child is file_version for child in workbook), (
+        '<fileVersion> must be a direct child of <workbook>')
+
+    attributes = set(file_version.attrib)
+    missing = sorted(FILE_VERSION_ATTRIBUTES - attributes)
+    unexpected = sorted(attributes - FILE_VERSION_ATTRIBUTES)
+    assert not missing, (
+        'workbook <fileVersion> is incomplete; missing ' + ', '.join(missing)
+        + '. Omit <fileVersion> or provide appName="xl" and complete numeric '
+          'lastEdited/lowestEdited/rupBuild fields')
+    assert not unexpected, (
+        'workbook <fileVersion> has unsupported attributes: '
+        + ', '.join(unexpected))
+    assert file_version.attrib['appName'] == 'xl', (
+        'workbook <fileVersion> appName must be "xl"')
+    for name in ('lastEdited', 'lowestEdited', 'rupBuild'):
+        value = file_version.attrib[name]
+        assert value.isascii() and value.isdigit(), (
+            f'workbook <fileVersion> {name} must be an unsigned decimal integer, got {value!r}')
+    assert not list(file_version) and not (file_version.text or '').strip(), (
+        'workbook <fileVersion> must not contain child elements or text')
 
 
 def inspect(path):
     with ZipFile(path) as archive:
         assert archive.testzip() is None, 'ZIP CRC mismatch'
-        documents = {name: ET.fromstring(archive.read(name)) for name in archive.namelist()
-                     if name.endswith(('.xml', '.rels'))}
-        workbook = documents['xl/workbook.xml']
+        workbook_name = 'xl/workbook.xml'
+        workbook = ET.fromstring(archive.read(workbook_name))
+        _validate_workbook_metadata(workbook)
+        documents = {workbook_name: workbook}
+        documents.update({
+            name: ET.fromstring(archive.read(name))
+            for name in archive.namelist()
+            if name != workbook_name and name.endswith(('.xml', '.rels'))
+        })
         sheets = workbook.findall('s:sheets/s:sheet', NS)
         assert len(sheets) >= 2, 'expected summary and at least one round'
         relationships = {item.attrib['Id']: item.attrib['Target']

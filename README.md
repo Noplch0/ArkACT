@@ -4,7 +4,7 @@
 
 基于 [ArkFramework](https://github.com/wuyu8512/ArkFramework)，以紧凑浮层展示玩家与干员伤害，并将整局和各轮数据保存为多工作表 XLSX 报表。
 
-- 当前版本：**1.0.0**
+- 当前版本：**1.0.1**
 - 运行平台：**Windows x64**
 - 适用模式：**仅卫戍协议**
 - 下载地址：[GitHub Releases](https://github.com/Noplch0/ArkACT/releases)
@@ -35,7 +35,7 @@
 
 ## 安装与更新
 
-1. 从 [Releases](https://github.com/Noplch0/ArkACT/releases) 下载已公开发布的 `ArkACT-v1.0.0-windows-x64.zip`；同名 `.sha256` 文件可用于校验下载完整性。
+1. 从 [Releases](https://github.com/Noplch0/ArkACT/releases) 下载已公开发布版本的 `ArkACT-v<版本>-windows-x64.zip`；同名 `.sha256` 文件可用于校验下载完整性。
 2. 将压缩包解压到一个临时目录。
 3. 把压缩包内的 `plugins/stronghold_stats.dll` 复制到：
 
@@ -44,14 +44,14 @@
    ```
 
 4. 如果旧版本已被框架加载，请先通过框架正常卸载插件，或在框架未运行时替换文件；不要覆盖正在使用的 DLL。
-5. 通过 ArkFramework 正常启动游戏，按 **Insert** 打开或关闭框架浮层（如修改过按键，以框架设置为准）。进入卫戍协议后，插件加载成功且已有统计数据时会显示版本号 **1.0.0**。
+5. 通过 ArkFramework 正常启动游戏，按 **Insert** 打开或关闭框架浮层（如修改过按键，以框架设置为准）。进入卫戍协议后，插件加载成功且已有统计数据时会显示所加载版本的版本号。
 
 > **整个 ArkFramework 和本插件都应放在游戏安装目录之外。** 游戏目录可能清理非原版 DLL，不要把插件复制进游戏本体目录。
 
 可选：在下载目录用 PowerShell 计算 ZIP 的 SHA256，并与 `.sha256` 文件中的值核对。
 
 ```powershell
-Get-FileHash .\ArkACT-v1.0.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\ArkACT-v1.0.1-windows-x64.zip -Algorithm SHA256
 ```
 
 运行插件不需要安装 Python、Visual Studio 或报表生成工具。
@@ -159,6 +159,10 @@ Get-FileHash .\ArkACT-v1.0.0-windows-x64.zip -Algorithm SHA256
 ### 工作簿导出失败
 
 检查 ArkFramework 目录是否可写、磁盘空间是否充足，并关闭可能占用同名文件的表格软件后重试。界面会显示写入结果或失败原因；失败时会保留待写快照供重试，但进程关闭后无法保证仍能恢复未写出的数据。
+
+### Excel 打开报表时提示修复“工作簿属性”
+
+1.0.1 修复了导出文件中的兼容性问题。更新插件后新导出的报表可正常打开。旧文件不会自动改写，可以在 Excel 完成修复后另存为新文件；如果插件仍保留该局数据，也可以重新导出。热重载会清空内存统计，更新前请先保存需要保留的报表。
 
 ### 重载插件后历史轮次消失
 

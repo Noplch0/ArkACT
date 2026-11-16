@@ -1,4 +1,4 @@
-name: Release draft
+name: Release
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag matching common/stronghold_version.h (e.g. v1.0.0)'
+        description: 'Existing tag matching common/stronghold_version.h (e.g. v1.0.1)'
         required: true
         type: string
 
@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-draft:
+  build-and-release:
     runs-on: windows-2022
     timeout-minutes: 45
     permissions:
@@ -66,11 +66,13 @@ jobs:
         run: |
           python tools/inspect_binary.py
           if ($LASTEXITCODE -ne 0) { throw 'Plugin validation failed.' }
+          python -B -m unittest discover -s tests -p 'test_inspect_workbook.py'
+          if ($LASTEXITCODE -ne 0) { throw 'Workbook inspector regression tests failed.' }
           python tools/inspect_workbook.py
           if ($LASTEXITCODE -ne 0) { throw 'Workbook validation failed.' }
       - name: Package plugin and licenses
         run: ./tools/package-release.ps1 -Tag $env:RELEASE_TAG
-      - name: Create or update draft only
+      - name: Publish verified release as Latest
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -78,18 +80,18 @@ jobs:
           $existing = gh api "repos/$env:GH_REPO/releases?per_page=100" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect existing releases.' }
           $release = @($existing | Where-Object tag_name -CEQ $env:RELEASE_TAG)
-          if ($release.Count -gt 1) { throw 'Ambiguous release tag.' }
-          if ($release.Count -eq 1 -and -not $release[0].draft) { throw 'Refusing to alter an already published release.' }
+          if ($release.Count -ne 0) { throw 'Refusing to overwrite an existing release; inspect it before retrying.' }
           $zip = ".build/release/ArkACT-$env:RELEASE_TAG-windows-x64.zip"
-          if ($release.Count -eq 0) {
-            gh release create $env:RELEASE_TAG $zip "$zip.sha256" --draft --verify-tag --title "ArkACT $env:RELEASE_TAG" --notes-file .github/RELEASE_NOTES.md
-          } else {
-            gh release upload $env:RELEASE_TAG $zip "$zip.sha256" --clobber
-          }
-          if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed.' }
-          $draft = gh release view $env:RELEASE_TAG --json isDraft,url,assets | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or -not $draft.isDraft -or $draft.assets.Count -ne 2) { throw 'Release is not the expected two-asset draft.' }
-          "Draft verified: $($draft.url)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          gh release create $env:RELEASE_TAG $zip "$zip.sha256" --latest --verify-tag --title "ArkACT $env:RELEASE_TAG" --notes-file .github/RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed; inspect the remote release before retrying.' }
+          $published = gh release view $env:RELEASE_TAG --json tagName,isDraft,isPrerelease,url,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $published.isDraft -or $published.isPrerelease -or $published.tagName -cne $env:RELEASE_TAG -or $published.assets.Count -ne 2) { throw 'Release is not the expected two-asset public release.' }
+          $names = @($published.assets.name | Sort-Object)
+          $expected = @([IO.Path]::GetFileName($zip), ([IO.Path]::GetFileName($zip) + '.sha256') | Sort-Object)
+          if (Compare-Object $expected $names) { throw 'Unexpected release assets.' }
+          $latest = gh api "repos/$env:GH_REPO/releases/latest" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $latest.tag_name -cne $env:RELEASE_TAG -or $latest.draft -or $latest.prerelease) { throw 'Latest does not point to the published release.' }
+          "Latest release verified: $($published.url)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
       - name: Preserve validation logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

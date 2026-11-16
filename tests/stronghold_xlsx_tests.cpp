@@ -330,6 +330,10 @@ void test_workbook_structure_and_fixture() {
     }
 
     const std::string workbook = entry_data(archive, "xl/workbook.xml");
+    // An incomplete <fileVersion appName="xl"/> makes Excel repair workbook
+    // properties even though XML parsing and ZIP CRC validation both succeed.
+    // This exporter is not Excel and must omit that optional application record.
+    CHECK(workbook.find("<fileVersion") == std::string::npos);
     CHECK(workbook.find("整局汇总") != std::string::npos);
     CHECK(workbook.find("第1轮") != std::string::npos);
     CHECK(workbook.find("第1轮(2)") != std::string::npos);

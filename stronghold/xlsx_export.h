@@ -482,7 +482,10 @@ inline std::string make_workbook_xml(const std::vector<std::string>& sheet_names
     xml << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>";
     xml << "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" ";
     xml << "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">";
-    xml << "<fileVersion appName=\"xl\"/><workbookPr/>";
+    // Excel rejects an incomplete fileVersion record during normal loading.
+    // This optional record describes the producing spreadsheet application;
+    // omit it rather than claiming an Excel editing version for our exporter.
+    xml << "<workbookPr/>";
     xml << "<bookViews><workbookView xWindow=\"0\" yWindow=\"0\" windowWidth=\"24000\" windowHeight=\"12000\"/></bookViews>";
     xml << "<sheets>";
     for (std::size_t index = 0; index < sheet_names.size(); ++index) {
