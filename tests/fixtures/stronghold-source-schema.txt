@@ -1,0 +1,28 @@
+# STATIC SUPPLEMENT - NOT A LIVE CLIENT EXPORT.
+# This file fills only source-ownership ABI facts omitted by
+# stronghold-schema-14412.log. The inheritance and getter declarations come from
+# current-client method mapping and static GameAssembly inspection performed on
+# 2026-11-15; they are not claimed as new runtime observations.
+# Do not copy offsets or infer gameplay side ownership from this fixture.
+
+CLASS Torappu.Battle.BObject [Torappu.Battle.BObject] : System.Object
+ PROPERTY playerSide
+ METHOD Torappu.PlayerSide get_playerSide()
+
+CLASS Torappu.Battle.Unit [Torappu.Battle.Unit] : Torappu.Battle.Entity
+
+CLASS Torappu.Battle.Enemy [Torappu.Battle.Enemy] : Torappu.Battle.Unit
+
+CLASS Torappu.Battle.Token [Torappu.Battle.Token] : Torappu.Battle.Character
+ PROPERTY initSideType
+ METHOD Torappu.Battle.SideType get_initSideType()
+ METHOD System.Boolean get_isEnemySideToken()
+
+CLASS Torappu.Battle.Trap [Torappu.Battle.Trap] : Torappu.Battle.Token
+
+# ENUM VALUE SIMULATION - NOT A LIVE METADATA CAPTURE.
+# The client report records names but not values. These two values preserve the
+# existing production ABI checks; no PlayerSide SIDE_* or SideType.ENEMY values
+# are introduced as attribution rules here.
+FIELD Torappu.PlayerSide.INVALID value=0
+FIELD Torappu.Battle.SideType.ALLY value=1

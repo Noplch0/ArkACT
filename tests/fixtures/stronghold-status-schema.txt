@@ -1,0 +1,75 @@
+# Stronghold Protocol 2.1.0 supplemental schema fixture.
+# Only types absent from stronghold-schema-14412.log are declared as CLASS.
+# Qualified FIELD value= lines enrich existing enums without duplicating classes.
+
+FIELD Torappu.AutoChessGameStateType.BATTLE value=4
+FIELD Torappu.AutoChessGameStateType.HELP_BATTLE value=5
+FIELD Torappu.AutoChessGameStateType.BOSS_BATTLE value=6
+FIELD Torappu.AutoChessGameStateType.BATTLE_WAITING value=100
+FIELD Torappu.AutoChessGameStateType.SETTLE value=7
+FIELD Torappu.AutoChessGameStateType.END value=8
+FIELD Torappu.AutoChessGameStateType.PAUSE value=9
+FIELD Torappu.AutoChessPlayerGameStateType.BATTLE_NOT_COMPLETE value=4
+FIELD Torappu.AutoChessPlayerGameStateType.BATTLE_COMPLETE value=5
+
+CLASS .IRoundStatus [Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.IRoundStatus]
+ METHOD System.Int32 get_enemyCntInTotal()
+ METHOD System.Int32 get_enemyEscapedDisplay()
+ METHOD System.Int32 get_curEnemyCnt()
+ METHOD System.Int32 get_lostHpDisplay()
+ METHOD System.Boolean get_battleFinished()
+
+CLASS .SelfBattleRoundStatus [Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.SelfBattleRoundStatus] : System.Object
+ FIELD <enemyCntInTotal>k__BackingField : System.Int32 offset=0x10 flags=0x21
+ FIELD <battleFinished>k__BackingField : System.Boolean offset=0x14 flags=0x21
+ FIELD <enemyKilledCnt>k__BackingField : System.Int32 offset=0x18 flags=0x21
+ FIELD <enemyEscapedCnt>k__BackingField : System.Int32 offset=0x1c flags=0x21
+ FIELD enemyEscapedInstIds : System.Collections.Generic.HashSet<System.Int32> offset=0x20 flags=0x6
+ FIELD enemyEscapedTokenInstIds : System.Collections.Generic.HashSet<System.Int32> offset=0x28 flags=0x6
+ FIELD enemyKilledInfos : System.Collections.Generic.List<Torappu.Battle.AutoChess.BattleEnemyKilledInfo> offset=0x30 flags=0x6
+ FIELD m_scheduler : Torappu.Battle.Scheduler offset=0x38 flags=0x6
+ METHOD System.Int32 get_enemyCntInTotal()
+ METHOD System.Void set_enemyCntInTotal(System.Int32)
+ METHOD System.Int32 get_curEnemyCnt()
+ METHOD System.Int32 get_enemyEscapedDisplay()
+ METHOD System.Int32 get_lostHpDisplay()
+ METHOD System.Boolean get_battleFinished()
+ METHOD System.Void set_battleFinished(System.Boolean)
+ METHOD System.Int32 get_enemyKilledCnt()
+ METHOD System.Void set_enemyKilledCnt(System.Int32)
+ METHOD System.Int32 get_enemyEscapedCnt()
+ METHOD System.Void set_enemyEscapedCnt(System.Int32)
+ METHOD System.Void Reset(System.Boolean)
+ METHOD System.Void .ctor()
+
+CLASS .HelpBattleRoundStatus [Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.HelpBattleRoundStatus] : System.Object
+ FIELD <enemyCntInTotal>k__BackingField : System.Int32 offset=0x10 flags=0x21
+ FIELD selfEnemyEscapedRemaining : System.Int32 offset=0x14 flags=0x6
+ FIELD selfEnemyEscapedCntInHelpBattleState : System.Int32 offset=0x18 flags=0x6
+ FIELD killInfos : System.Collections.Generic.List<Torappu.Battle.AutoChess.HelpBattleEnemyKilledInfo> offset=0x20 flags=0x6
+ METHOD System.Int32 get_enemyCntInTotal()
+ METHOD System.Void set_enemyCntInTotal(System.Int32)
+ METHOD System.Int32 get_curEnemyCnt()
+ METHOD System.Int32 get_enemyEscapedDisplay()
+ METHOD System.Int32 get_lostHpDisplay()
+ METHOD System.Boolean get_battleFinished()
+ METHOD System.Void Reset()
+ METHOD System.Void .ctor()
+
+CLASS .BossBattleRoundStatus [Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.BossBattleRoundStatus] : System.Object
+ FIELD <enemyCntInTotal>k__BackingField : System.Int32 offset=0x10 flags=0x21
+ FIELD battleProcess : System.Int32 offset=0x14 flags=0x6
+ FIELD battleTeamHp : System.Int32 offset=0x18 flags=0x6
+ FIELD bossHpRatio : System.Single offset=0x1c flags=0x6
+ FIELD playerTotalHp : System.Int32 offset=0x20 flags=0x6
+ METHOD System.Int32 get_enemyCntInTotal()
+ METHOD System.Void set_enemyCntInTotal(System.Int32)
+ METHOD System.Int32 get_curEnemyCnt()
+ METHOD System.Int32 get_enemyEscapedDisplay()
+ METHOD System.Int32 get_lostHpDisplay()
+ METHOD System.Boolean get_battleFinished()
+ METHOD System.Void Reset()
+ METHOD System.Void .ctor()
+
+COLLECTION System.Collections.Generic.Dictionary<System.Int32,Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.SelfBattleRoundStatus>
+ METHOD System.Boolean TryGetValue(System.Int32, Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.SelfBattleRoundStatus&)

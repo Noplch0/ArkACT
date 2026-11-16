@@ -1,0 +1,539 @@
+# AGENTS.md — 卫戍协议伤害统计插件维护与重建指南
+
+本文件面向继续开发本仓库的 agent。目标不仅是说明如何编译现有代码，还要保存足以重新实现插件的架构、数据语义、已验证入口、失败经验和游戏更新适配方法。
+
+- 文档基线：2026-11-15，源码版本 `common/stronghold_version.h` 中的 **2.1.2**。
+- 源码、当前客户端元数据及可复现测试优先于本文中的历史快照。更新实现后必须同步本文件，不能为了符合旧文档强行恢复旧结构。
+- 产品：仅适用于《明日方舟》卫戍协议的只读统计插件；支持 1–4 人本地模拟数据，不是通用伤害插件、独立注入器或游戏修改器。
+- 这份文档不代表已完成所有实机验收，尤其不能把模拟测试通过等同于当前游戏版本联机实测通过。产品契约是维护目标，不应误读成所有防护已经完备；当前实现的明确边界见第 9.1 节。
+
+## 1. 工作边界：先读再动
+
+1. **不得修改游戏玩法数据。** 不写伤害、血量、技能、资源、战斗状态、存档、结算或服务器数据；不添加游戏命令执行、网络上报、作弊或绕过检测功能。
+2. 允许的采集路径是 ArkFramework 原生 Hook + IL2CPP 元数据/只读 getter/集合查询。Hook 跳转、线程附着、GC handle 保活和浮层输入保护属于实现机制，不能宣传为“进程内存完全零修改”。
+3. **用户可能仍在对局。** 除非明确要求，不关闭/重启游戏，不附加调试器，不主动执行插件重载，不覆盖正在使用的 `D:\tools\ArkFramework\plugins`。默认只在项目内构建，由用户决定何时部署和重载。
+4. 游戏目录会清理非原版 DLL。依赖框架的加载机制，框架与插件保持在游戏目录外；不要把本项目改成往游戏目录投放 DLL 的独立加载器。
+5. 保持单一 `stronghold_stats.dll`，零前置**插件**依赖。运行仍需要兼容的 ArkFramework 和配套 ArkImGui，不能把“零插件依赖”说成“不需要宿主/图形运行库”。
+6. 不恢复 `damage_meter.dll`、`operator_stats`、RDPS、buff 服务、`buff_capture`、`-EnableBuffService` 或 `ark.battle.events` 消费链。旧 damage_meter 可共存，但不能成为本插件的数据来源或前置条件。
+7. 严格区分读到的事实、静态分析推断和待实机验证假设。缺数据应显示不兼容/部分采集/未归属告警，不能用全零、房间名单或猜测的玩家状态伪造“正常”。
+8. 不依赖工作区一定有 Git；没有 `.git` 时用文件清单、哈希和备份记录改动。不要清理用户文件或整目录删除 `.build` 来省事。
+9. 诊断与提交内容不得泄露原始 UID、昵称编号等账户标识。诊断只记录昵称是否存在，不写昵称值；报表按当前设计仅保留显示昵称和 P1–P4 槽位，不额外导出账户标识。
+10. **每次更新都必须同步维护 AGENTS.md，作为交付前的强制收尾步骤，包括本次对话。** 凡涉及本项目的功能、修复、游戏适配、测试、构建、配置、诊断、文档或维护约束更新，都必须在本次任务结束前修订受影响章节，并在第 9.2 节记录日期、主要变更、实际验证结果及未完成/待实机事项；不能只在回复中说明、留待下次补写或只改日期。不涉及技术内容变化时，也须复核现有说明并记录“已复核，无技术变更”。记录只保留必要结论，不复制完整对话或敏感信息；未同步本文不得宣称本次更新完成。
+
+## 2. 产品契约与计量口径
+
+- 已归属玩家主排名：友方干员造成的 **`abs(Modifier.realDelta)` 实际扣血**。计算伤害、治疗和元素损伤是附加指标，不可替换主排名。
+- DoT、召唤物、陷阱、弹射物在证据充分时归回所属干员和玩家；来源或宿主不明时明确保留未归属行，不猜测归属。不单列已确认宿主的召唤物或 DoT 行；同一玩家的同 ID 干员实例合并并显示实例数，不同玩家同名干员必须隔离。
+- **整局/本轮** 与 **战斗/协防** 是两个独立维度。准备、暂停和结算不累计战斗时间；自己等队友时只冻结自己的主战时间，其他未完成玩家仍可继续计时。协防的伤害与时间不并入主战阶段。Boss 战属于战斗阶段。
+- 每个玩家使用自己的有效战斗时长，干员 DPS/HPS 也使用所属玩家在所选范围、所选阶段的有效战斗时长，不用全房间最长时间，也不用插件加载以来的墙钟时间。
+- 当前客户端正数 `currentRound` 已是显示轮次，**不要再加 1**。准备阶段 `raw <= 0` 映射为第 1 轮，`0 -> 1` 不应制造换轮事件。
+- 只读轮次选择：可查看已完成轮次；选择历史后保持固定，选择当前轮后跟随。新轮次不能清空整局累计。
+- 对局外保留刚结束的一局用于查看；下一场会话开始才替换。当前缓存仅在插件内存中，卸载/重载不会自动从报表恢复。
+- 实际本地模拟集合覆盖全部在线房间玩家才称全房间；只有自己称本机；其余称部分采集。不按画质选项直接决定统计能力。
+- 1–4 人是产品边界；`kMaxPlayers = 8` 是内部容错容量，不代表支持 8 人房间。
+
+## 3. 源码地图与重建模块
+
+| 文件/目录 | 责任及重建时应保留的接口 |
+| --- | --- |
+| `include/ark/plugin.h` | ArkFramework ABI、host API、插件声明及生命周期导出 |
+| `include/ark/imgui_config.h` | 与共享 ArkImGui 一致的 ImGui import/export 配置 |
+| `common/stronghold_version.h` | 插件唯一版本常量，不要在多个位置维护不一致版本 |
+| `common/il2cpp_exports.h` | 项目使用的精简 IL2CPP 导出定义 |
+| `common/il2cpp_runtime.h/.cpp` | 元数据查类/字段/方法、签名校验、字段读取、调用、集合与 GC Root/线程管理 |
+| `common/unity_input.h/.cpp` | 浮层输入保护、原生输入 Hook 和卸载生命周期 |
+| `stronghold/types.h` | POD 事件、枚举、线程安全有界事件队列 |
+| `stronghold/capture_policy.h` | 会话身份、范围判断等可脱离游戏测试的策略 |
+| `stronghold/capture.h/.cpp` | NativeCapture：绑定元数据、8 个采集 Hook、归属、轮次/阶段/计时采样 |
+| `stronghold/model.h` | 纯逻辑统计模型：整局、当前轮、历史轮、双阶段、去重与玩家时钟 |
+| `stronghold/view_state.h` | 只读 UI 范围/阶段/轮次选择，不驱动游戏状态 |
+| `stronghold/plugin.cpp` | 宿主生命周期、`pump_events()`、模型/报表协调、ImGui 浮层 |
+| `stronghold/csv_export.h` | 共用报表行语义和兼容 CSV；现有 UI 主导出不是 CSV |
+| `stronghold/xlsx_export.h` | 不依赖 Excel 的 C++ OOXML/ZIP-store/CRC32 生成器 |
+| `stronghold/report_archive.h` | 整局与逐轮快照、结束时间命名、失败重试与归档 |
+| `diagnostics/metadata_report.h/.cpp` | 元数据报告和保留的运行态快照；升级排障的首要入口 |
+| `third_party/il2cpp-mod-template/` | 直接编入插件的精简只读后端，须保留 MIT 与 UPSTREAM 说明 |
+| `reference/il2cpp-mod-template/` | 用户提供工具的完整参考源码，**不是**另一个需要部署的运行时 DLL |
+| `tests/fixtures/` | 公开回归用的元数据最小子集及显式 status/source 补充；无运行态/账户数据 |
+| `reference/current-schema/` | 本机私有原始证据（Git 忽略），不作为干净检出或 CI 的输入 |
+| `reference/dump-audit/` | 历史 dump 研究，仅作定位线索，不作当前偏移事实 |
+| `tests/` | 九组纯逻辑、模拟元数据和 ImGui 回归测试 |
+| `tools/inspect_binary.py` | PE/导出/依赖/旧功能及禁用写能力检查，含实际加载 query 检查 |
+| `tools/inspect_workbook.py` | 不依赖插件生成器的独立 ZIP/XML/XLSX 内容校验 |
+| `build-plugin.ps1` / `verify.ps1` | 发布构建 / MSVC 测试及七个生产源文件编译检查；支持可移植路径与自动发现 |
+| `tools/dependencies.lock.json` / `prepare-dependencies.ps1` / `package-release.ps1` | 固定工具链/ArkImGui 来源、干净检出准备与不捆绑宿主的发布包 |
+| `.github/workflows/release-draft.yml` | 标签校验、验证/构建、仅创建 Release 草稿 |
+| `README.md` / `AUDIT.md` / `dist/部署说明.txt` | 用户文档 / 历史修复证据 / 部署说明，改功能须同步 |
+
+## 4. 从零准备与构建
+
+### 4.1 依赖来源与目录
+
+- 宿主源码：<https://github.com/wuyu8512/ArkFramework>。使用与目标宿主发布版配套的 `plugin.h`、ImGui 头文件、`ArkImGui.dll` 与 GNU 导入库 `libArkImGui.dll.a`，不能混用不兼容版本。
+- IL2CPP 参考：<https://github.com/Mr-Courage/il2cpp-mod-template>。本项目 vendored 基线为 commit `ee2afbf528f73012c493277aff934f18440f21e6`，来源见 `third_party/il2cpp-mod-template/UPSTREAM.md`。
+- 只移植该模板的 API 表、解析器、不透明类型和 Windows 符号适配器；不接入它的独立注入入口、独立 ImGui 上下文、示例业务 Hook 或网络功能。
+- 目前精简后端 API 表为 65 项，保留元数据、只读调用、线程与 GC 所需能力。禁止直接用上游完整表替换而恢复 setter、对象/字符串/数组创建、装箱、程序集加载或反射类型构造。
+- Windows x64，C++20，Zig/Clang GNU 目标。发布 DLL 与共享 ArkImGui 使用相容的 GNU/Itanium C++ ABI；MSVC 在这里用于测试和编译检查，不能直接替代发布构建。
+- MSVC Build Tools 和 Windows SDK 用于离线验证，Python 3 用于两个独立产物检查脚本；**运行插件不需要 Python、Excel 或额外报表 DLL**。
+
+默认目录布局如下，路径可以迁移，但必须同步脚本的真实约定：
+
+```text
+D:\Projects\
+  ArkF-ACT\
+    include\ark\plugin.h
+    .tools\zig\ziglang\zig.exe    # 可用 -Zig 替代
+    dist\ArkImGui.dll
+    dist\libArkImGui.dll.a
+  ArkFramework-main\
+    third_party\imgui-1.91.9b\
+```
+
+`build-plugin.ps1` 默认仍取相邻 `ArkFramework-main\third_party\imgui-1.91.9b`，现已支持 `-ImGuiDir`。干净检出可先运行 `tools/prepare-dependencies.ps1`：按 `tools/dependencies.lock.json` 固定 ArkFramework commit 94c616fc4c115603983a62fd0fc6f3928db482b1 和 Zig 0.17.0（下载核对 SHA256），校验 SDK 两个头文件一致，只编译共享 ArkImGui 和导入库到项目 dist，并输出 `.build/dependencies.json`。不会构建/启动宿主或注入器；不向游戏部署。不能假设旧 dist 或本机相邻源码存在。
+
+### 4.2 可执行构建步骤
+
+在项目根目录 PowerShell 执行；以下命令只构建项目产物，不部署、不重载游戏：
+
+```powershell
+Set-Location 'D:\Projects\ArkF-ACT'
+
+# 先检查依赖；不存在就先准备，不要用空文件或不匹配的库绕过。
+Test-Path '.tools\zig\ziglang\zig.exe'
+Test-Path '..\ArkFramework-main\third_party\imgui-1.91.9b\imgui.h'
+Test-Path 'dist\libArkImGui.dll.a'
+Test-Path 'dist\ArkImGui.dll'
+
+& '.\build-plugin.ps1'
+# 自动查找失败时，用 -Zig 指定实际存在的 zig.exe，不要求本机必须有 .tools 中的副本。
+# 构建输出：dist\plugins\stronghold_stats.dll
+Get-Item 'dist\plugins\stronghold_stats.dll'
+Get-FileHash 'dist\plugins\stronghold_stats.dll' -Algorithm SHA256
+```
+
+脚本真实参数为 `-Zig`、`-DistDirectory`、`-ArkImGuiImportLibrary`、`-ImGuiDir`。指定其他输出目录时，也要提供对应导入库，或用 `-ArkImGuiImportLibrary` 显式指定。Zig 查找顺序含显式参数、项目 `.tools`、PATH 和 WinGet 路径。历史构建实测过 Zig 0.17.0，README 曾推荐 0.15.2；换版本必须重跑验证，不保证所有 Zig 版本兼容。
+
+发布构建的七个 translation unit：
+
+```text
+stronghold/plugin.cpp
+stronghold/capture.cpp
+common/il2cpp_runtime.cpp
+common/unity_input.cpp
+diagnostics/metadata_report.cpp
+third_party/il2cpp-mod-template/il2cpp/il2cpp_api.cpp
+third_party/il2cpp-mod-template/platform/il2cpp_module_windows.c
+```
+
+编译器由脚本统一使用 `zig c++ -x c++`（包括最后的 `.c` 文件），主要参数：
+
+```text
+-target x86_64-windows-gnu -O2 -std=c++20
+-DNOMINMAX -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN
+-DIMGUI_USER_CONFIG=<ark/imgui_config.h>
+```
+
+包含 `include`、匹配 ImGui、`stronghold`、`common`、`diagnostics` 和精简第三方后端目录；最终 `-shared`，链接匹配的 `libArkImGui.dll.a` 与 `-luser32`。不要在插件内再编一套生产 ImGui。
+
+### 4.3 公开仓库与 Release draft
+
+- 仓库为 git@github.com:Noplch0/ArkACT.git，默认分支 main；首次公开版本 1.0.0 对应标签 v1.0.0。不重写已有远程历史、不移动已发布标签。
+- .github/workflows/release-draft.yml 监听 v* 标签，也支持 workflow_dispatch 的既有 tag；标签必须与版本头一致并指向构建 commit。固定第三方 Actions commit，Windows runner 自动发现工具链。
+- 流程：锁定依赖 -> 九组测试/七个 TU -> Zig GNU x64 DLL -> inspect_binary/inspect_workbook -> tools/package-release.ps1 -> gh 创建/更新 **draft**。失败不创建草稿；已有正式 Release 拒绝覆盖。需要该 job 的 contents:write 权限，不需要额外个人 token secret。
+- 发布附件只有 ArkACT-v<版本>-windows-x64.zip 与 .sha256。ZIP 含 plugins/stronghold_stats.dll、部署/README、GPL 与精简后端 MIT 许可及 build-info.json（源码 commit、依赖、DLL hash/大小）；不捆绑 ArkImGui/宿主/注入器。DLL 的最终哈希以附件 build-info 和校验和为准，不把本机旧 DLL 哈希写成 CI 哈希。
+- .gitignore 排除 .build、.tools、原始 reference、真实诊断、导出报表和 dist 二进制。公开测试仅使用 tests/fixtures 的元数据声明/显式静态补充，不含运行态快照、UID、昵称值或游戏模块。参考源码需要时按上游固定 commit 另取；不把用户教程或完整 dump 推上仓库。
+- 发布前实际审查暂存文件及账号隐私，使用 GitHub noreply 提交身份。推送 main 和版本标签后必须观察 Actions 结果，并通过认证 API 确认 draft=true、标签与两个附件；不能只提交 YAML 就宣称 Release 已完成。草稿需协作者登录，不能承诺匿名可见。
+- 本次版本重标不改变采集、归属、时钟、导出与只读玩法边界；内部 2.x 审计保留原编号。离线/CI 通过仍不代表联机实测通过。
+
+### 4.4 宿主 ABI 与生命周期
+
+- SDK ABI 为 1；初始化核验 host struct size、ImGui 版本和所需回调、输入、Hook API，不可盲用旧结构。
+- 四个 C 导出必须存在：`ark_plugin_query`、`ark_plugin_initialize`、`ark_plugin_shutdown`、`ark_plugin_can_unload`。插件 query 声明零插件依赖。
+- `initialize()` 先建立插件模型/归档状态、创建 UnityInput 对象并注册宿主输入适配器及 frame/draw 回调，随后返回等待运行时；它不代表元数据和采集 Hook 已同步绑定成功。实际的 `initialize_capture()` 与 `UnityInput::initialize()` 由 `on_frame()` 中的 `retry_runtime_connection()` 延迟连接/重试。未 ready 时不能让采集回调访问半初始化状态。
+- 实际卸载顺序：先由 `can_unload()` 检查被捕获的按键/鼠标已释放，`UnityInput::shutdown()` 安全停止输入 Hook；再由 `shutdown_capture()` 禁止新采集、移除采集 Hook 并等待在途回调排空，释放采集器 Root；随后 `pump_events()` 消费复制后的事件并归档，最后解除 input adapter、销毁输入对象和插件状态。任一步失败都拒绝卸载，必须保留仍会被回调访问的状态，不能强行释放 DLL。
+- 归档失败也要保留快照以便重试。宿主进入 shutdown 前可能已移除帧回调，**不能承诺卸载失败后后台还会自动重试**；用户需再次请求卸载。
+- `ark_plugin_can_unload` 当前只是输入按键/鼠标预检，返回 true 不保证随后 shutdown 一定成功；Hook 排空、待写报表、输入 adapter 注销等检查实际发生在 shutdown。
+
+## 5. 从零实现的数据管线
+
+```text
+游戏线程上的生命周期/Update/伤害 Hook
+  -> 元数据校验 + 卫戍模式与会话识别
+  -> 读取已结算 Modifier，解析来源与玩家/宿主干员
+  -> 复制数值与字符串到 POD Event
+  -> EventQueue（有界、线程安全）
+渲染回调 pump_events()
+  -> 纯逻辑模型（整局/轮次 × 战斗/协防）
+  -> 只读 ViewSelection / ImGui 浮层
+  -> ReportArchive / 纯 C++ XLSX 导出
+```
+
+跨线程只传复制后的事件，不能把 `Character*`、Manager/DataCenter、托管字符串地址或枚举器存进 UI/报表模型。游戏对象读取限于受控游戏线程；渲染、导出和卸载线程不要遍历玩法对象。对需要跨回调保留的托管引用使用现有 Root/GC handle 封装，不缓存裸地址冒充存活证明。
+
+### 5.1 动态 IL2CPP 解析规则
+
+使用 `common/il2cpp_runtime.*` 与精简后端从已加载 `GameAssembly.dll` 导出解析运行时 API，按 namespace + class + field/method 名称和**完整签名**查找。禁止把 dump 的 RVA、文件偏移、字段偏移直接写进业务代码。
+
+- 核验值/引用类型、static/instance、返回类型、参数类型、by-ref、泛型闭合后的集合类型和可执行入口。新增 source/playerSide 的元数据证据在 `reference/current-schema/stronghold-source-schema.txt`，它是显式静态补充而非新局内导出。只按名字或参数数量找到一个方法不够安全。
+- 当前 `Torappu.FP.ONE == 4294967296`（Q32.32），读取后除以该比例转为数值；比例/布局不符即拒绝采集，不把 FP 当 float/double 解释。
+- `Modifier` 是 value type；其字段偏移由元数据取得，当前运行时报告包含对象头基准，因此代码减去 `2 * sizeof(void*)` 转为未装箱 `Modifier&` 内偏移，并用 value size 做边界检查。这是**经验证的动态布局处理**，不是允许写死旧字段偏移；运行时布局变更必须重新验证。
+- `IS_CONTINUOUS_FLAG`、`IS_ENVIRONMENT_DAMAGE` 常量必须与支持逻辑一致；状态枚举值按名称解析，不能凭旧 dump 的整数复用。
+- `TryGetValue(key, out value)` 的 out 存储大小由真实值类型决定：`ChessInst&` 对应指针大小，`Int32&` 才是 4 字节。
+- `runtime_invoke` 只用于经审查的只读 getter/集合查询；不得因为名字像 getter 就默认无副作用。不要调用 Ensure/Create/Set/Add 等玩法方法来“帮助”查询成功。
+
+### 5.2 当前元数据锚点与八个采集 Hook
+
+核心类型：`Torappu.Battle.{Entity, Character, Projectile, Modifier, BattleLogger, BattleController, BattlePlayerData, BattleCharacterData}`、`Torappu.FP`；卫戍类优先位于 `Torappu.Battle.DataCenter` 与 `Torappu.Battle.AutoChess`，实际回退逻辑以 `bind_classes()` 为准。`ScenePlayerData` 是 `AutoChessPlayerDataModel` 的嵌套类，不是独立 namespace 类。
+
+`NativeCapture::bind_hooks()` 当前精确安装下列八个入口，全部是实例 `System.Void` 方法：
+
+| 类 | 方法/参数 | 用途 |
+| --- | --- | --- |
+| `Torappu.Battle.Entity` | `OnAppliedModifier(Torappu.Battle.Modifier&)` | 主伤害入口，原函数执行后读取已赋值的 realDelta |
+| `Torappu.Battle.BattleLogger` | `LogModifier(Torappu.Battle.Modifier&)` | 伤害后备入口 |
+| `Torappu.Battle.BattleLogger` | `LogEpModifier(Torappu.Battle.Modifier&)` | 元素/相关 Modifier 后备入口 |
+| `Torappu.Battle.BattleController` | `StartGame()` | 控制器生命周期、识别开始 |
+| 同上 | `ClearRunTimeData()` | 清理前保存/结束；注意 Time 的真实大小写 |
+| 同上 | `OnDestroy()` | 销毁生命周期兜底 |
+| 同上 | `Update()` | 游戏线程状态与时钟采样 |
+| `Torappu.GlobalInitializerAndUpdater` | `Update()` | Manager 尚未存在/消失时的全局生命周期采样 |
+
+框架 Hook ABI 只适用于已确认的 Windows x64 整数/指针寄存器参数形式（至多四个），不能把复杂结构体、浮点或栈参数方法直接套进同一 detour 模板。修改入口时连同原函数指针签名和 IL2CPP 附带方法参数约定一起核验。所有 Hook 的元数据/ABI 先完整解析，验证通过后才开始创建和启用；任一个关键入口不兼容就安全停采，不带病运行。
+
+### 5.3 伤害事件：原函数时机与幂等
+
+- `Entity.OnAppliedModifier` 是主入口；当前客户端 Logger 调用位于可选 XLua 分支，只 Hook Logger 可能昵称正常但永远无伤害。
+- 原函数前保存当前阶段上下文，原函数后读取 `realDelta`。不能在扣血结算前读取默认 0，也不能修改传入 Modifier。
+- 以 **线程 ID + Modifier 指针** 在受互斥保护的在途 applied 栈记录当前调用范围，抑制同一次应用内部触发的 Logger 重复记录；它不是跨 tick 地址去重，也不要求编译器 TLS。模型的 sequence 检查只过滤同序号/旧序号回放，不能替代采集入口的逻辑事件去重。
+- **禁止按 Modifier 地址、相同伤害数值或短时间窗口跨 tick 去重。** 持续伤害会复用对象和数值，这样会吞掉合法 DoT。连续伤害标志只标识性质，仍并入实际总量。
+- 读取 `get_source` / `get_originalSource`、`get_target` / `get_playerSide`、`get_finalDelta`、`get_damageType`、`get_isDamage`、`get_isHeal`、`get_isCancelled`、`get_isElementDamage`。完整直接来源优先；直接来源非空但回溯失败、玩家未知或宿主不完整时也尝试 originalSource。每个候选单独捕获 C++/托管调用错误，不让一次 getter 失败阻止安全回退；不尝试恢复访问冲突或猜地址。
+- **原来源不能抢归属**：已有完整玩家/干员不被 originalSource 覆盖；玩家已知但 token 宿主不完整时，只接受同一玩家的完整宿主。多层召唤物和弹射物均限制 16 层并防环。回退前保留并检查未经替换的直接来源链；若明确为 Enemy，则直接过滤，不能让友方 originalSource 将敌方攻击重新归给玩家。
+- **目标证据**：applied Hook 的 `self` 是权威受击对象；Logger 后备读取 `Modifier.target`。新增未知/环境回退只对运行时实际 `Torappu.Battle.Enemy` 实例的扣血生效，绝不单靠 `SideType.ENEMY` 判断（右侧队友也可能是该视觉侧别）。当前不将仅有“敌方 Token”标志的非 Enemy 对象作为已支持目标，缺证据计诊断，适配见第 6 节。
+- **无来源保留**：没有可确认的来源，但受击对象为实际 Enemy、事件为已结算实际 HP 伤害且 `abs(realDelta)>0` 时，以 `kUnknownPlayer / unknown_effect / 无来源附加伤害` 保存。未知项参与“已采集总量”和占比，但不属于任何真实玩家/干员；可能包含无法区分的环境扣血，不可宣传为全是友方输出。全局未知桶没有可靠玩家时钟，DPS/HPS 安全为 0，不借用全房间时长。
+- **环境标志不是自动丢弃条件**：带 `IS_ENVIRONMENT_DAMAGE` 的已确认敌人 HP 伤害可保留；有直接/原来源则按证据归属，没有则进入上述全局未知行。友方/未知/null 目标的环境事件、明确 Enemy 来源的攻击/自伤、取消事件和未知来源的治疗/元素积累不混入此回退。未知有效来源、保留的无来源伤害各自每轮至多一次 UI 告警；正常敌方攻击仅过滤，不触发不兼容告警。
+- 诊断保留 `original_source_fallback/source_side_recovered/environment_recovered/source_errors/target_rejected/missing_host/side_conflicts`、当前与最后未归属样本；只记录类名、flags、数值和槽位，不记录 UID、昵称编号或昵称值。`unresolved_source` 同时可能包含被保留的全局未知项，不能单凭它断言丢伤害。计算/治疗/元素各自保持语义，不把治疗计入伤害。
+- 当前模型 `damage_type_index()` 的类型快照为 1=物理、2=法术、3=真实、5=元素实际伤害，`StatsModel::add_to()` 将 type 4 计入治疗；`ElementalBuildup` 则只将 calculated_damage 计入元素损伤，不计进实际扣血排名。游戏更新须重新核对 `DamageType` 元数据及这两处消费者，不能因为事件都有 actual_damage 字段就全部当扣血。
+
+### 5.4 玩家、干员与召唤物归属
+
+当前客户端的主归属链：
+
+```text
+Modifier.source / originalSource
+  -> 若为 Projectile：递归 Projectile.source
+  -> Character
+  -> 若为 token：BattleCharacterData.isToken / tokenOrHostUniqueId 回溯宿主
+  -> 宿主 Character.cardUid（UInt32）
+  -> AutoChessDataCenter.indexer.runtimeCard2Chess（ListDict<uint, ChessInst>）
+  -> ChessInst.instId（Int32）
+  -> instId2PlayerIndex（Int32 -> Int32）
+  -> ScenePlayerData / PlayerCard.nickName
+  -> (玩家索引, 宿主干员 ID) 聚合键
+```
+
+- 同时核对 `ChessInst.cardUid` 与 `ChessInst.playerIndex`，不能只拿一个看似合理的整数认定归属。
+- `bind_indexer()` 根据字段存在性选择兼容分支：新结构 `runtimeCard2Chess -> ChessInst`；旧结构 `runtimeCard2ChessDict<uint,int> -> instId2PlayerIndex`。旧 `runtimeToken2CardDict` 只是反向运行卡片索引，**不是召唤物宿主表**，新结构中不能强制要求它存在。
+- 宿主角色查找以 `BattlePlayerData.characters/tokens` 及 `BattleCharacterData.uniqueId/isToken/tokenOrHostUniqueId` 为依据，递归必须限制深度并检测循环。陷阱/弹射物的归属也走同一来源链，不另猜玩家。
+- `rebuild_host_cache()` 从 `BattleController.get_playerDataList` 遍历上述角色数据；干员 ID 优先 `id`、回退 `tmplId`，名称优先 `nameCn`、回退 `nameEn`。`resolve_character()` 也会使用 `Character.get_characterId`/`get_data` 补全；名称只能作显示，缺名称时导出转换为“未知干员”，不能把 ID 当用户可读名称泄露出去。
+- `rebuild_host_cache()` 在正常 250ms 运行态 tick 每次刷新，不能只在玩家人数或轮次改变时刷新；动态生成的 token 也会即时登记其宿主链。同一轮内保留**复制后的**宿主描述和经卡片索引验证过的 owner，支持宿主离场后的迟到弹射物/DoT；token 宿主链改变或 owner 冲突时使旧归属缓存失效。新会话、换轮、controller 更换/新战斗、离开模式必须清理，不能跨生命周期沿用重用 UID。
+- `live_host_cards_` 仅表示当前扫描到的角色，覆盖范围只用它和真实伤害事件，不能从保留的 `hosts_ / host_players_` 历史描述伪造仍在模拟的玩家。扫描失败清当前集合与 side 映射，但可保留本轮复制的宿主用于迟到事件。
+- 非 Character 的来源 Entity/陷阱代理，可读取其**自身继承的** `BObject.get_playerSide()`。仅当 `BattlePlayerData.playerSide` 下的角色经实际卡片索引指向唯一玩家，且 side→player 和 player→side 均无冲突时，才能将明确 Enemy 目标的附加伤害计入该玩家的 `unknown_effect / 未归属附加伤害` 行；不能猜干员。
+- `PlayerSide` 不是房间槽位，不能用 enum 数字/顺序直接换算 P1–P4。`Modifier.playerSide` 是调用者指定的上下文，当前仅记诊断，不用于推定玩家；它与来源 `BObject.playerSide` 不可混淆。`INVALID` 由运行时名称解析并排除。字段和 getter 都校验精确 `Torappu.PlayerSide` 类型。
+- 来源判友方不能只按左右场地的 `get_initSideType` 一刀切：右侧模拟角色若有已验证 AutoChess 玩家归属也应允许统计。无有效玩家映射且不是友方的来源才被侧别过滤，避免把队友全当敌方。
+- 玩家当前 raw index 为 1–4，对应 P1–P4，不再 +1；0 回退 P?，负数视为未归属。不要把 room list 下标、显示槽位和实例 ID 混用。
+- nickname 只作显示，不作身份或聚合键；不采集 `nickNumber`。结构里若仍有未使用兼容字段，不等于运行时还在读取/报表导出该值，修改前核对读写链。
+- 当前未知干员显示可读回退名称，不在报表里暴露内部干员 ID；保留问题标记供定位，不用名字反推身份。
+
+### 5.5 卫戍模式、会话与轮次
+
+- 先查 `AutoChessGameManager.get_instanceOrNull`，确认 Manager 存在后才读 `manager.dataCenter`。**不要直接调用 AutoChessDataCenter.get_instanceOrNull**：已见客户端在内部解引用空 Manager，局外会抛 `System.NullReferenceException`。
+- 会话身份组合 `stageRandomSeed + 初始固定 UID 名单 + DataCenter identity`。UID 仅用于内部身份比对，不写日志/报表；退出改变在线状态，不改变固定名单，避免误触发新会话。
+- 新模拟开始发 SessionStart，清旧模型和 UI 选择；跨轮发 RoundStart，只切轮快照，不清整局。手动重置请求必须等新 SessionStart 成功后再消费，绑定暂时失败不能吞掉请求。
+- `currentRound` 正值直接作为显示轮次；`raw <= 0` 准备值映射为 1。
+- **`AutoChessSettleDataModel.endingStatus != 0` 不能代表会话已结束。** 该值仅诊断；曾错误用它停采，导致局内能读到昵称却所有伤害为 0。
+- 真正游戏 END 锁定结束墙钟时间并只发布一次 SessionEnd；Manager/DataCenter 消失作为兜底。阶段 END/SETTLE 与最后连续 Modifier 落在同 fixed tick 时允许继承前一阶段；正常 Update 确认终态后清该 latch，不能无限延长旧阶段。
+
+### 5.6 每玩家时钟与协防分离
+
+`NativeCapture::bind_timing()` / `sample_timing()` 是计时适配入口。基本原则是**先用旧阶段/旧 timing mask 结算刚过去的间隔，再读取新状态用于下一段**，避免把等待时长补进协防。
+
+- Manager 的 `gameStatus.get_currentState` 按名称解析 `BATTLE`、`BATTLE_WAITING`、`HELP_BATTLE`、`BOSS_BATTLE`、`PAUSE`、`SETTLE`、`END`。
+- 玩家有效计时需 `ScenePlayerData.gameState == BATTLE_NOT_COMPLETE`、连接 `ONLINE` 且 `!get_isDead()`。淘汰只由 `isDead` 确认，不能凭 hp==0 或 gameFinished 猜。
+- 主战还需查询 `battleStatus.m_selfBattleStatusInfo.TryGetValue(playerIndex, out status)` 的 `battleFinished`。只查已有行，不调用可能修改状态的 Get/Ensure 路径；缺行保留已确认的 gameState 判断并告警，不能猜该玩家已打完。
+- 自己进入 `BATTLE_WAITING` 时冻结自己的主战时间，其他仍未完成的玩家继续各自计时；不能冻结整房间，也不能让自己的 DPS 在等队友期间持续下降。
+- `HELP_BATTLE` 单独计 Assist。参与者优先用有效 `battlePlayerIndex`（至多两人），否则用有效 `helpBattleData.players`；冲突或缺失要告警，不用“所有在线玩家”伪造参与名单。
+- 协防名单外观测到的真实伤害仍保留，并提示计时/DPS 不完整，不能为了漂亮 DPS 丢实际伤害。
+- 当前客户端 Help/Boss 的 `get_battleFinished` 原生实现固定 false，不能将其作为完成判断。Boss 归 Main，不能误混到协防。
+- 明确退出/掉线/淘汰后保留历史总量并冻结计时；连接状态未知时保留可归属的有效伤害，但不凭空增加未知战斗时间，显示不完整警告。
+- 模型中的个人 `active_time` 是 DPS/HPS 分母，所选 view 的 `battle_seconds` 不是每个玩家共用的分母。零时间必须安全输出 0，不能 NaN/Inf 或除零。
+
+### 5.7 覆盖范围、队列与模型
+
+- 将真正观察到的本地角色卡片归属与有效伤害事件集合，对比在线房间玩家集合；不能把房间名单、画质档位或 `battlePlayerIndex` 本身当成本地模拟证明。
+- 角色可能早于索引就绪，首次归属失败后必须在后续游戏帧重新确认，不能永久缓存为“只有自己”。
+- `EventQueue` 容量当前 32768；每次 publish 分配新 sequence，模型拒绝 `sequence <= last_sequence` 的陈旧回放。相同逻辑伤害以**新序号**重复 publish 仍会重复统计，必须靠入口去重解决。溢出必须显式标记不完整，不可悄悄丢事件后仍声称完整。
+- Main/Assist 各自维护 session、current round 和 completed rounds；Idle 不计伤害时间。轮结束保存只读快照，历史数据不再被当前计时污染。
+- `find_round_view(round, phase)` 读取历史或当前阶段视图，不存在返回 nullptr，不能自动创建空历史轮。
+- `ViewSelection.selected_round == 0` 表示跟随当前轮，其余为固定历史轮；只在 SessionStart 重置选择，不在每次 RoundStart 强制重置。
+
+### 5.8 界面、局外查看与导出
+
+- HunterPie 式紧凑浮层：玩家按实际伤害降序，显示昵称/P 槽位、伤害、DPS、占比、条形图；展开显示所属干员，自己高亮。
+- 两个切换按钮分别控制整局/本轮和战斗/协防；标题显示“范围-阶段”。本轮模式提供历史轮选择及前后翻页。
+- 行是否显示根据**所选阶段**的实际数据/时长和对应 live timing mask，不能拿另一阶段成员掩码显示一排假零玩家。
+- 表格使用剩余空间、固定表头并可滚动，详细说明进 popup；不要恢复占据底部的大块不可见 child 区域。
+- 局外只读显示上一局，不能因当前 AutoChessDataCenter 不存在就把缓存清空/窗口全隐藏。无数据且不在模式内时才按现有 UI 策略处理。
+- UI 主导出为一个 XLSX：整局累计 Sheet + 每轮 Sheet，每张按战斗/协防分行；报表阶段文字实际为“主战/协防”，UI 按钮为“战斗/协防”。保留兼容 CSV 代码不意味着需要恢复 CSV 主导出。
+- 当前 15 列依次为：**阶段、维度、轮次、玩家槽位、玩家、干员、实例数、实际伤害、战斗时间(秒)、DPS、伤害占比、计算伤害、治疗量、HPS、元素损伤**。
+- 不导出原始 UID、昵称编号、干员 ID、统计范围或单独状态列；在线/中途退出等状态附在玩家显示名括号中。P1–P4 是房间槽位，不是账户昵称编号。
+- 数值单元格必须是数值；占比保存数值并使用百分比 style，不拼成文本；昵称等用 OOXML inlineStr，不能形成表格公式。正确转义 XML 和处理 UTF-8 中文。
+- 报表占比分母为所选范围、所选阶段的 `View::actual_total()`（含未归属实际伤害），干员行也是对该总量占比，不是“玩家内部占比”。可归属玩家时长用自己的 active_time；未归属行暂用该 view 的 battle_seconds 回退，不能将这个回退值宣传为已确认的个人 DPS。
+- 完整结束后用**结束时的本机本地时间**命名 `yyyy-MM-dd HH-mm.xlsx`，例如 `2026-11-14 19-30.xlsx`（Windows 文件名不能用冒号）。同分钟冲突添加 `(2)` 等后缀，不覆盖其他对局。
+- 进行中或中断使用含 pid/session 的备用名称，不冒充正常整局结束时间；导出失败保留快照以便重试，重试应保留原来锁定的结束时间，通过临时文件/原子替换避免半写文件。
+- XLSX 实现是自包含 ZIP store + CRC32 + OOXML，无压缩库/Office/外部报表运行时依赖；改生成器时要同步独立解析检查，不仅测试“文件存在”。
+
+## 6. 游戏更新后的适配流程
+
+以下章节给出升级排障步骤与入口替换准则。适配必须以当前元数据、实际调用链和测试证据为依据，不允许猜偏移或靠吞异常恢复假正常。
+
+### 6.1 先建立可比较的客户端证据
+
+1. 记录插件版本、宿主/ArkImGui 版本、DLL SHA256、游戏版本/模块时间戳、复现人数、实际发生故障的阶段、重载时机。不要仅凭文件修改时间认定用户加载了新 DLL。
+2. 优先请用户在**局内、实际有伤害发生后**点“导出诊断”；计时故障最好分别在主战、等待、协防采样。不要为了拿日志让用户退出正在玩的对局。
+3. 当前报告路径为 `<ArkFramework root>\diagnostics\stronghold-schema-<pid>.log`，同进程再次导出会覆盖原文件；需要对比时复制到带日期/阶段的项目证据目录。不要把用户的原始附件覆盖成自制夹具。
+4. 报告中 `Snapshot tick` 是**采样时刻，不是导出时刻**；`CURRENT`、`LAST IN-MODE SNAPSHOT`、`LAST COMBAT SNAPSHOT` 和最多 16 个状态变化历史要结合看。计数器从插件加载起累计；退出后 CURRENT 无 Manager 并不意味着局内也没有 Manager。
+5. 诊断导出可在局外枚举元数据，并附上此前游戏线程复制的状态字符串；**不能为导出最新数据在渲染线程重新遍历 live DataCenter**。插件重载后旧内存快照不再存在。
+6. 报告缺失类型时先确认 `REPORT COMPLETE` / `REPORT INCOMPLETE`、模块加载和导出解析情况。泛型实例和继承的 closed singleton 方法不一定出现在普通 image 类列表中，缺记录不等于运行时一定不存在。
+
+当前本机游戏文件定位线索（仅只读，换机先核实路径）：
+
+```powershell
+$gameRoot = 'D:\Program Files\Hypergryph Launcher\games\Arknights Game'
+$assembly = Join-Path $gameRoot 'GameAssembly.dll'
+$metadata = Join-Path $gameRoot 'Arknights_Data\il2cpp_data\Metadata\global-metadata.dat'
+Get-Item -LiteralPath $assembly, $metadata | Select-Object FullName,Length,LastWriteTime
+Get-FileHash -LiteralPath $assembly, $metadata -Algorithm SHA256
+```
+
+路径不存在时按用户安装目录重新定位，不扫描/修改整个磁盘，也不要把不同更新批次的 GameAssembly 与 metadata 配对。静态研究输出放项目证据目录，不放游戏目录。
+
+### 6.2 先走诊断漏斗，再改代码
+
+按下列顺序找第一个失败层。上层不通时不要盲改下层；一个昵称能读到，只证明房间数据的一小部分可读。
+
+| 层 | 核对证据 | 首要源码位置 / 处理 |
+| --- | --- | --- |
+| 1. 宿主与渲染 ABI | 四导出、ABI=1、host size、ImGui 版本、回调/输入/Hook API | `include/ark/plugin.h`、`plugin.cpp::host_compatible/initialize`；先解决宿主兼容，不碰游戏偏移 |
+| 2. IL2CPP 模块/导出 | `GameAssembly timestamp/size`、`Resolved exports`、`MISSING EXPORT` | `common/il2cpp_runtime.*`、精简 API resolver；分清尚未初始化和真正导出变更 |
+| 3. 元数据绑定 | 类、继承、字段类型、方法签名、闭合集合 out 类型 | `NativeCapture::bind_classes/bind_fields/bind_getters/bind_timing/bind_indexer` |
+| 4. 模式/会话 | `mode_present`、`capture_active`、`controller_present`、session、round | `tick_runtime/begin_battle/leave_mode`；检查 nullable Manager 链与 END，而非看 endingStatus 猜结束 |
+| 5. Hook 真命中 | `hooks applied/logger_hp/logger_ep`、8 个绑定记录及 RVA | `bind_hooks` 与 `on_*`；地址仅作当前证据，不复制回生产代码 |
+| 6. 事件过滤 | `outside_mode/cancelled/wrong_type/unresolved_source/environment/zero/exceptions`、`last_modifier/last_unresolved_modifier`、`last_read_failure` 及来源恢复计数 | `record_damage`；找真实过滤原因，不一口气删除保护条件 |
+| 7. 归属/覆盖 | `runtime_cards/instance_owners/host_cache/live_cards/verified_source_sides/roster`、`unknown_player`、local/observed/simulated/active masks | `refresh_index_maps/rebuild_host_cache/resolve_character/player_for_card/read_players` |
+| 8. 队列/模型 | `events published` 与 plugin 导出的模型/队列快照、sequence、session/round | `types.h`、`pump_events()`、`model.h`；published 增长但 UI 不动时先查消费/筛选 |
+| 9. 时钟/阶段 | `game_state/stats_phase/timing_mask/assist_members`、各玩家 gameState/online/isDead | `sample_timing/player_in_combat/read_damage_phase`；逐阶段验证，不用全局开关代替每人时钟 |
+| 10. 视图/报表 | 所选范围/阶段/轮次、find_round_view、报表快照及磁盘写入错误 | `view_state.h`、`draw_header/draw_table`、`report_archive.h/xlsx_export.h` |
+
+常用本地搜索（不启动游戏或加载游戏模块）：
+
+```powershell
+Select-String -Path 'reference\current-schema\stronghold-schema-14412.log' `
+  -Pattern 'CLASS |COLLECTION |OnAppliedModifier|runtimeCard2Chess|TryGetValue'
+Select-String -Path 'stronghold\capture.cpp' `
+  -Pattern 'bind_hooks|record_damage|tick_runtime|sample_timing|resolve_character'
+```
+
+### 6.3 更新类型/字段/集合绑定
+
+1. 用新报告对比 `reference/current-schema/stronghold-schema-14412.log` 与 `stronghold-status-schema.txt`。34052/4708 是历史失败证据，不能任选旧报告替代新客户端。
+2. 按**语义和真实字段类型**定位替代结构：DataCenter 持有的 playerDataModel/indexer、ScenePlayerData 的玩家索引/连接/死亡状态、Character 的 cardUid、集合的真实 key/value。优先从已知引用的 field type/return type 获取类，而不是全库碰运气猜名字。
+3. 类型搬 namespace 可在 `find_class_with_fallback` 增加有依据的分支；字段改名或值类型变成引用类型则需显式新分支，不能宽泛 catch 后当空集合继续。
+4. 闭合集合通过**字段类型**取 class，再验证其 `TryGetValue`。新 `ListDict<uint,ChessInst>` 与旧 `Dictionary<uint,int>` 不能共用 4 字节 out buffer；同时复核 reference/value type、返回 Boolean、instance 标志。
+5. 自动属性 backing field 可包含 `<...>k__BackingField`；优先用存在且已确认只读的 getter。继承字段/方法需沿父类查找，嵌套类需走 nested lookup。不要修改托管对象来补一个缺失字段。
+6. 若 FP 比例、Modifier value type/header 基准、枚举 underlying type 或 Hook ABI 变更，先写边界/负例测试，再更新解析；关键结构无法证实时停止该采集功能并显示不兼容。
+7. 变更 binder 的同时扩充 `metadata_report.cpp::wanted()` 和闭合集合报告逻辑，使用户下次一份诊断就能提供所需结构，而不是反复索要无关截图。
+
+### 6.4 伤害入口重命名或不再命中时如何定位
+
+不要把“重新 Hook 另一个名字”当成适配方案；需要重新证明**实际扣血写入 -> 通知调用 -> 插件读取时机**：
+
+1. 先确认局内 `capture_active=1`、伤害阶段非 Idle，并在产生真实攻击后观察计数变化。如果 `applied` 增加而 `outside_mode` 增加，先修模式/会话状态，不能直接换伤害入口。
+2. 若旧 Hook 已绑定却 0 命中，检查新元数据中 `Entity`/其父类的 Modifier 应用/扣血通知方法以及调用者；检查是否移到其他类、签名改为 by-value、增加参数或分离元素通道。方法存在不证明该模式会执行它。
+3. 用同一客户端的 GameAssembly + metadata 做只读离线分析：从 `Modifier.realDelta` 的赋值点和 HP 应用路径回溯到合适通知；对比可选 Logger/XLua 分支，确认主战、DoT、召唤物、协防都经过该链。
+4. 反汇编/反编译时保存函数完整签名、调用关系、字段类型、赋值发生在回调前还是后、线程与生命周期证据。RVA 和地址只写研究记录，生产仍由元数据找 MethodInfo/入口。
+5. 框架可支持的 ABI 才能直接 Hook。新方法超出四个整数/指针寄存器或使用 FP/struct/栈参数时，选择语义等价且 ABI 可证明的邻接通知入口；不要强转函数指针后试运行。
+6. 先保存原函数前阶段，再调用原函数，原函数后读取已结算的 realDelta。保持嵌套应用抑制机制，测试主入口+Logger 同次只计一次、下一 tick 同值 DoT 仍计一次。
+7. 若必须临时增加探测，只在同一框架插件内增加受控只读计数/结构采样，限制频率与日志大小，不记录玩家账户信息；由用户选择部署/重载时机。不另塞独立探测 DLL 到游戏目录。
+8. 形成最小复现测试：旧逻辑在新证据下失败，修复后通过。一次只改必要兼容分支，不同时重写模型、界面和导出以掩盖入口问题。
+
+#### 6.4.1 附加伤害 / 无来源 / 召唤物专项（2.1.2）
+
+1. 在具体干员/盟约发生效果时于**局内**导出，先看 `applied/published/unresolved_source/environment_recovered/missing_host`。不把局外 nullable singleton 消失误当伤害入口缺失。
+2. 若 `original_source_fallback` 增长且数据正常，说明直接来源失效但原来源已恢复；直接来源存在不代表完整，不要恢复旧的 null-only 回退。若 `source_errors` 增长，结合 `last_read_failure` 定位哪个只读 getter 变更，不能吞异常后假装来源为空且都归自己。
+3. 查看 `last_unresolved_modifier` 的 `source_class/original_class/target_class/modifier_side`。对新增来源类型，先让诊断 `wanted()` 输出它的完整继承、只读 getter 和字段；确认是否确为 Character/Token/Trap，或仅是 Entity/BObject。`Projectile` 与 `Entity` 在当前基线是 BObject 下的兄弟，不能凭图形外观假设 Modifier.source 一定是 Projectile。
+4. 卡片/实例/玩家索引、`BattlePlayerData.playerSide` 及来源 BObject.playerSide 必须相互验证。若 `side_conflicts` 增长，保持未知，定位是否数组混入其他玩家或 side 语义已改变；不以多数票/数组顺序/Modifier.playerSide 代替。
+5. `missing_host` 增长时追查真实 token 数据的 `isToken/uniqueId/tokenOrHostUniqueId` 与当前 controller 的角色/召唤物数组。先检查新 token 是否及时刷新、宿主退场前是否采过身份、卡片是否换轮重用，再考虑其他有证据的宿主 getter。不得猜最近攻击者、按伤害大小分摊或把 token 自身 ID 冒充宿主。
+6. 来源全空且 target 是实际 Enemy 时，全局未归属承伤是**有意保留的边界**，并非已经找到玩家。若未来要精确归盟约/干员，必须找到该效果的可靠源上下文并增加反例测试；不能把 `Modifier.playerSide` 从“诊断线索”直接改成所有场景的来源证明。
+7. 当前只对实际 Enemy 类型开启无来源/环境回退。若新内容用非 Enemy 的敌方 Token，须先取得真实类型和 `isEnemySideToken` 等可靠目标证明，补右侧队友/召唤物、敌方自伤、友伤和空目标的反例，再扩大目标谓词。不要改成 `SideType.ENEMY` 就全收。
+8. 无来源总量可能含环境扣血；给用户说明它表示未能归属的敌方承伤。源身份、目标证据、有效伤害或时钟缺失时如实提示，不许借恢复总量的名义伪造玩家排名/DPS。
+
+### 6.5 如何使用用户提供的 il2cpp-mod-template
+
+该工具已经真正参与当前实现：`third_party/.../il2cpp_api.cpp` 与 Windows module adapter 直接链接进发布 DLL；不是“文档里提了一次但运行时仍依赖 damage_meter”。参考副本可以用来理解运行时反射和校验流程：
+
+- `reference/il2cpp-mod-template/il2cpp_core/src/`：API/元数据访问实现。
+- `reference/il2cpp-mod-template/src/probe.cpp`：类结构探测，迁移其只读逻辑到现有 `diagnostics`，不照搬独立引导。
+- `reference/il2cpp-mod-template/docs/quickstart.md`：类定位与 dump 思路。原模板的 `dump_class`/`dump_max_fields` 是它自己的 `mod.ini` 功能，**不是本插件现有配置项**；本插件入口是“导出诊断”。
+- `reference/il2cpp-mod-template/docs/pitfalls.md`：继承、backing field、API 表跨 TU 布局、旧 dump 偏移等陷阱。改 API 表后必须重编全部七个源文件，避免不同 translation unit 认为表布局不同。
+- `third_party/il2cpp-mod-template/UPSTREAM.md` 与 `LICENSE`：当前移植范围、来源 commit、精简理由与 MIT 授权。上游变动不能未经审查覆盖本项目精简 API。
+
+离线 dump/原生分析是补充，不要求用户换加载器。项目 `.tools` 中可能保留 Il2CppDumper 的 static/inspect 研究版及源码；它们是机器上的辅助工具，**不是发行依赖或必定可用的通用更新工具**：
+
+- 先核验新客户端 metadata 版本和所用工具支持情况；自动搜索失败就报告失败，不猜注册表地址、元数据版本或旧 RVA。
+- 工具必须按数据文件读取 PE/metadata，不能为了离线分析触发 `GameAssembly.dll` 的初始化或不受控 `PELoader.Load`。只用已审查的 static 分支；不要直接运行来源不明的二进制。
+- 历史 `ARKF_STATIC_INSPECT` 特殊分支使用过特定客户端的 codegen module 地址/数量，**不能将该分支当成更新后自动定位器**。重用前需从新版本重新定位并只在研究代码中记录依据，生产不得继承这些常量。
+- 模板运行时枚举也有局限：closed generic 往往需沿真实 field type/class 查询，不能只枚举 image 普通类。诊断应补足该证据，而不是从旧 dump 复制签名伪装成当前实测。
+- `%USERPROFILE%\Downloads\教程` 中的旧 dump（2026-10-09）只作历史导航；新实测优先。`.build` 内旧分析也不是从零重建的必备输入。
+
+### 6.6 常见症状与禁止的“修复”
+
+| 症状 | 优先核对 | 禁止的假修复 |
+| --- | --- | --- |
+| 局外/结束后 NullReferenceException | 是否直接读 DataCenter singleton；比较 LAST COMBAT 与 CURRENT | 给空指针硬填地址、在 UI 线程强读玩法对象 |
+| 能读自己昵称，但伤害全 0 | applied 命中、outside_mode、endingStatus 误判、realDelta 读取时机 | 认为昵称正常就元数据全兼容，改用 calculated 冒充实际伤害 |
+| 高画质仍只有自己 | 玩家 raw 1–4、真实 ChessInst 集合、索引就绪时序、TryGetValue out ABI、覆盖 mask | 从画质/房间名单造队友零数据，强制 badge 为全房间 |
+| DoT 少计或完全消失 | 是否错误按地址/相同数值去重、originalSource/宿主链、主入口 | 在 UI 单加一个 DoT 估值或跨 tick 去重 |
+| 同次伤害翻倍 | applied 内 Logger 是否被抑制，sequence 是否重放 | 按相同伤害大小统一除二 |
+| 打完等队友时 DPS 降低 | 玩家 battleFinished、BATTLE_WAITING 和逐人 timing_mask | 整房间一有人打完就停止全部计时，或用“没伤害若干秒”猜等待 |
+| 协防混入主战或等待补进协防 | 旧 phase/mask 先结间隔、HELP_BATTLE 名单及独立容器 | 用同一累加器换标题，或照计所有在线玩家 |
+| 当前轮永远多 1 | currentRound 是否重复 +1、UI 与导出是否同一语义 | 只在 UI 减 1，模型/导出仍错轮 |
+| 切历史后马上跳回当前 | ViewSelection 是否被 RoundStart 重置 | 改游戏 currentRound 来切界面 |
+| 局外看不到刚结束数据 | 窗口可见性与 Manager 生存周期是否耦合 | 把残留游戏指针缓存到局外继续读 |
+| 表格底部大片空白/内容被挡 | ImGui 剩余高度、child/表格滚动与 popup 布局 | 隐藏数据行或固定极小显示人数 |
+| XLSX 有文件但打不开/占比无百分号 | ZIP CRC、OOXML rels、XML 转义、数值与百分比 style、原子替换 | 把 CSV 重命名为 xlsx，或用文本占比掩盖数据类型错误 |
+
+### 6.7 保存新证据并收敛适配
+
+每次适配在 `AUDIT.md` 记录：客户端标识/哈希、复现步骤、旧观察、根因、替代入口/类型及 ABI、修改文件、测试与实机结果、剩余风险。必要时在 `reference/current-schema` 保存脱敏的真实报告。
+
+- 真实报告和静态/模拟补充必须分开，补充应注明来源与假设，不篡改原报告让测试绿。
+- `stronghold_schema_tests.cpp` 目前重放 14412 报告 + status schema，并显式补充已核验但未被报告枚举到的 closed singleton；测试里为边界检查设置的尺寸不是声称运行时真实布局。
+- 增加新版本夹具和负例，不删除有价值的旧结构兼容测试。关键字段缺失、by-ref 变更、引用/值混淆应在安装任何 Hook 前失败。
+- 兼容修复通过后再按第 7 节完整验证，再让用户安排实机。源码/模拟通过不能宣称已经证明中高画质全员可采。
+
+## 7. 验证、验收与交付门槛
+
+### 7.1 离线验证命令
+
+`verify.ps1` 通过 PATH/vswhere 自动查找 x64 MSVC，选择已安装且同时有头文件/库的最新 Windows SDK；支持 `-ClPath`、`-ImGuiDir` 和 `-SdkVer` 显式覆盖。使用 CI 依赖时从 .build/dependencies.json 读取 ImGuiDir，不能把工具链缺失当业务测试失败。
+
+```powershell
+Set-Location 'D:\Projects\ArkF-ACT'
+& '.\verify.ps1'
+# 非默认安装时按实际位置传 -ClPath 与 -ImGuiDir。
+if ($LASTEXITCODE -ne 0) { throw 'verify failed' }
+
+& '.\build-plugin.ps1'
+if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+
+# 以下两个检查使用 Python 标准库。Windows 下请用 64 位 Python。
+python '.\tools\inspect_binary.py' '.\dist\plugins\stronghold_stats.dll'
+if ($LASTEXITCODE -ne 0) { throw 'binary inspection failed' }
+
+# verify 的 XLSX 测试会生成这个固定夹具。名称虽含2.1.0，仍是当前测试输出路径。
+python '.\tools\inspect_workbook.py' '.\.build\export-2.1.0-fixture\exports\报告.xlsx'
+if ($LASTEXITCODE -ne 0) { throw 'workbook inspection failed' }
+
+Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
+```
+
+`inspect_binary.py` 默认取项目 dist 下的插件；Windows 下会在**独立检查进程**加载插件并调用 query，使用上一级 dist 中的配套 ArkImGui，**不会调用插件 initialize 或附加游戏进程**。缺配套依赖时应补齐依赖，不跳过 DLL/query 检查后声称产物可用。
+
+检查至少包括 x64 PE32+、四个导出、ABI/版本、dependency_count=0、无 damage_meter/RDPS、导入白名单、无禁用的 IL2CPP setter/创建/状态 Ensure 符号。符号扫描不是完整安全证明，仍需代码审查 `runtime_invoke` 调用的语义，确认没有新增游戏写功能。
+
+### 7.2 九组回归测试各自保护什么
+
+| 测试 | 主要保护范围 |
+| --- | --- |
+| `stronghold_model_tests.cpp` | 1/2/4 人聚合、玩家/干员隔离、整局/本轮、双阶段与独立时钟、退出冻结、队列/sequence/重置 |
+| `stronghold_capture_tests.cpp` | 生产采集代码的模拟运行时：归属/来源/DoT、Hook 嵌套、时机、会话/轮次、计时和生命周期 |
+| `stronghold_schema_tests.cpp` | 真实报告与显式 source/status 静态补充重放、当前 binder、八个 Hook 的元数据前置验证及不兼容负例 |
+| `il2cpp_runtime_tests.cpp` | 元数据查找、签名/继承、类型/集合与运行时安全边界 |
+| `metadata_report_tests.cpp` | mock GameAssembly 导出解析、报告完整性/兼容性与隐私边界，不加载真实游戏 |
+| `stronghold_ui_tests.cpp` | ImGui 实际按钮/布局、选择生命周期、阶段成员、局外可见、历史与滚动 |
+| `stronghold_csv_tests.cpp` | 共用行语义、兼容 CSV 转义/中文/零分母、隐私列等回归 |
+| `stronghold_xlsx_tests.cpp` | ZIP/CRC32、OOXML、多 Sheet、15 列、中文、百分比、文本安全、原子写入/失败 |
+| `stronghold_report_tests.cpp` | 多轮归档、结束时间固定、同分钟冲突、进行中/中断、失败保留重试与默认写入器集成 |
+
+`verify.ps1` 还会编译全部七个生产源文件。UI 测试单独编译测试版 ImGui 是测试机制，不应照搬为发布插件内置另一套 ImGui。测试不能依赖游戏正在运行，也不能通过启动/关闭真实游戏获得绿灯。
+
+### 7.3 每次兼容修复至少增加的反证测试
+
+- 类型/ABI：关键方法 static/返回类型/by-ref 不符、FP 布局不符、缺字段、引用 out 被误当 Int32 时必须拒绝；失败不留下启用一半的 Hook。
+- 伤害：普通/DoT/动态及嵌套召唤物/弹射物、非空失效来源与候选异常回退、未知/环境 Enemy 承伤与友方/空目标反例、side 冲突、迟到效果和生命周期清缓存、最后一击改变阶段、Logger 嵌套；同次只计一次，下一 tick 同值连续伤害仍累加。
+- 模式：endingStatus 非零但仍战斗；局外 Manager 为 null；同局跨轮不清总量，名单退出不误开新局，真正新 session 清旧局。
+- 计时：四人中先结束一人的主战时间冻结，队友继续；等待后协防 1–2 人单计；名单不明有警告；掉线/淘汰/未知状态不造计时。
+- 轮次/UI：raw 0->1 不换轮；正 8 显示 8；历史固定、当前跟随、整局/本轮 × 战斗/协防四种组合；局外保留一局；长表可滚动且底部无挡板。
+- 报表：完整整局+每轮、两阶段、有限数值、零分母、昵称括号状态、百分比样式、无账户标识/干员 ID、中文/特殊字符/以等号开头的文本安全。
+- 生命周期：手动 reset 请求失败不吞；Hook 移除失败不释放状态；归档失败卸载延期且再次请求可重试，不能依赖已移除的帧回调。
+
+### 7.4 实机验收矩阵（由用户安排时机）
+
+| 场景 | 通过条件 |
+| --- | --- |
+| 单人 | 昵称、直伤/DoT/召唤物归属正确，实际伤害与采集到的扣血口径一致 |
+| 2 人/4 人，中高画质 | 若实际全员本地模拟，则所有已确认玩家有真实数据且 badge 正确；不同玩家同干员不混 |
+| 低画质/部分模拟 | 本机/部分采集准确，不造缺席玩家数据；角色和索引稍晚就绪仍能恢复范围 |
+| 先打完等待 | 自己伤害与主战时间均冻结，DPS 不因等队友下降；其他人继续计时 |
+| 协防 | 参与者真实伤害/时间进入协防，主战历史不变；旁观者不加协防时间 |
+| 离线/淘汰 | 状态正确，历史保留，后续计时冻结，不从固定会话名单删除 |
+| 轮次 | 第 8 回合显示第 8 轮，跨轮整局不清；可翻阅历史并返回跟随 |
+| 结束/局外 | 无 singleton 空异常，可查看刚结束整局和各轮；新局替换；报表按真正结束时间命名 |
+| 框架热重载 | 用户主动触发，无悬挂回调/崩溃；只采重载后的数据，不承诺恢复旧内存 |
+
+实机报告要写明游戏版本、插件版本、人数、范围、阶段和观察结果，未测试项明确标“待实机验证”。不得用模拟房间测试代替联网房间结论。
+
+## 8. 真正从空项目重建时的实现顺序
+
+若生产源码丢失，只有本文和依赖源码可用，按以下顺序重建，每步都保留纯逻辑测试；不要先写漂亮面板再临时拼数据：
+
+1. **宿主骨架**：取得匹配 ArkFramework SDK/ArkImGui，建立四导出、零插件依赖、版本常量、初始化/卸载保护，发布工具链用 GNU ABI。只显示“等待运行时/不兼容”诊断，先证明宿主可加载。
+2. **只读运行时与报告**：移植指定 commit 的精简 il2cpp_core API/Windows resolver，构建元数据查找/签名校验/GC Root 封装和结构报告；先让一次局内导出证明所有必要真实类型，不猜偏移。
+3. **纯数据层**：定义 SessionStart、Roster/Coverage、RoundStart、Clock、Damage/Elemental、Warning、SessionEnd 等事件语义与 sequence；建立有界队列、双阶段模型、玩家时钟、历史轮视图。事件从会话开始到轮次/时钟/伤害再结束按顺序消费。
+4. **生命周期/模式**：安装经验证的 StartGame/ClearRunTimeData/OnDestroy/两个 Update；用 nullable Manager->DataCenter 识别模式，建立固定身份，正确区分回合与整局。
+5. **实际伤害链**：接入 OnAppliedModifier 后置采样与两个 Logger 后备，抑制同次嵌套，正确读取 FP 和动态 value layout；原函数必须恰好调用一次，原始返回/异常行为不能被探测逻辑改变。
+6. **归属与覆盖**：实现 Projectile.source、token 宿主、cardUid->ChessInst->玩家，保留未知归属和警告；按真实本地证据判范围，不用 UI 名单冒充可采证据。
+7. **独立时钟**：实现先结旧区间再采新状态、逐人主战完成判断、等待冻结、协防参与名单和双阶段；将最终伤害归阶段与是否继续计时分离，避免漏最后一击。
+8. **只读 UI**：从模型构造排序行，加入两个 toggle、历史选择/跟随、可滚动表、自己高亮、范围/错误提示、局外缓存查看和手动 reset 请求。UI 不得直接访问玩法对象。
+9. **归档与隐私**：生成单 XLSX 多 Sheet，15 列、数值百分比、inlineStr、正确结束时间、原子写入、进行中/中断和重试；后台/卸载失败不丢快照。
+10. **可交付产物**：补齐九组测试与两个独立检查，构建真实 x64 DLL并核对导出/依赖，记录哈希；准备框架外置部署说明，再由用户选择实机测试/热重载。
+
+本文提供的名字和算法是插件 1.0.0（原内部 2.1.2）使用的客户端基线，重建到未来版本时仍需执行第 6 节确认入口。不能声称仅靠一份旧文档就无需新游戏元数据。
+
+## 9. 交付检查与知识维护
+
+- 功能改动只触及必要文件；纯文档任务不要改版本、生产源码、DLL 或运行中的框架。
+- 更新 `README.md`（用户行为/操作）、`AUDIT.md`（证据/根因/验证）、`dist/部署说明.txt`（部署要求）和本文（实现/升级知识）；仅改文档时不需要为形式而重编/部署。
+- 修改第三方移植范围时更新 UPSTREAM/许可证说明。项目沿用 GPL-3.0-or-later 约束，模板的 MIT 版权与许可必须保留，不能把二者混写成无条件闭源授权。
+- 交付说明列出实际改动、离线命令及结果、DLL路径/版本/哈希（确实构建才写）、待实机项；不要把历史验证冒充本轮新跑结果。
+- 未经用户要求，不在游戏目录部署、不替换使用中的插件、不主动重载。统计插件永远只观察，不增加游戏数据修改能力。
+
+### 9.1 当前实现边界：不要把维护目标当成已修复声明
+
+以下宿主边界来自此前 2.1.1 文档审查，未在本次来源修复中扩大处理；第 3 项已随 2.1.2 实施保守回退。仍未声称实机验收通过。后续处理其他边界时，先确认契约、补反例再局部变更：
+
+1. **帧对象信任边界**：`plugin.cpp::host_compatible()` 检查 host API struct 大小、ABI、ImGui 版本及必要函数指针，但 `on_draw()` 直接使用 `frame->imgui_context`，没有独立验证 frame 的大小/有效性。当前信任宿主传入有效帧，不能声称已做完整帧 ABI/上下文防护。重建时应明确该前置条件或补上可用的校验。
+2. **部分注册失败的回滚**：`initialize()` 先注册 frame 再注册 draw；若前者成功、后者失败，本地失败分支没有保存句柄并显式 remove_callback 已注册项。最终是否由宿主 owner 清理由框架加载失败契约决定，不能把本地分支描述为完整事务回滚；后续适配宿主必须核查这一契约。
+3. **来源边界（2.1.2 已部分修复）**：已增加来源失败回退、动态宿主缓存、来源对象 side 的验证映射，以及实际 Enemy 无来源承伤的未归属保留和一次告警。仍不声称任意脚本效果均可恢复：没有实际 Enemy 目标或可信友方来源、敌方非 Enemy Token、Hook 链外直接改血、完全失去宿主身份等仍需新局内诊断/对应干员盟约验证。无来源未知项可能包含环境承伤，不能当成某位玩家输出，也不能把 unresolved_source 全部盲加给自己。
+4. **有限去重保证**：sequence 是队列回放游标，不是全局事件身份。当前 applied 调用范围抑制解决已知嵌套 Logger，不能承诺跨线程、任意新入口或重复 publish 都会自动幂等。新增入口必须重做同次/跨 tick 对照测试。
+
+### 9.2 文档维护记录
+
+每次完成项目更新时追加一条简明记录，并同步相关正文；本表不能代替技术内容维护，也不能把未执行的验证写成已通过。
+
+| 日期 | 主要变更 | 验证与剩余事项 |
+| --- | --- | --- |
+| 2026-11-15 | 本次对话新增“每次更新必须同步维护 AGENTS.md”的强制收尾规则，明确适用范围、正文同步及维护记录要求。已复核，无技术变更。 | 仅检查文档 UTF-8 与新增规则/记录读回；未运行编译、业务测试或实机验收。未修改插件源码、版本或 DLL，未部署、重载或操作游戏；第 9.1 节已知边界与既有待实机项保持不变。 |
+| 2026-11-15 | 2.1.2：修复非空失效来源回退；动态/嵌套召唤物刷新、同轮迟到效果身份与覆盖集合分离；来源 side 唯一验证；无来源/环境 Enemy 承伤单列未知，不伪造玩家；补源类诊断、ABI/模型/报表回归；复核后拦截 Enemy 直接来源被友方原来源重标；同步正文适配步骤。 | 修复前来源回归实际红灯，修复后九组 MSVC 测试/七个 TU、Zig GNU DLL、query 2.1.2 零前置插件依赖/禁用写 API 扫描、XLSX 独立检查通过；模型18项、CSV6组、XLSX4组。本轮仅构建项目 dist，未部署/重载/操作游戏；具体盟约/干员与非 Enemy 目标边界待局内验证。 |
+
+| 2026-11-16 | 首次公开发布重标 1.0.0，保留原内部 2.1.2 采集功能；初始化 GitHub main 发布路径、固定 Zig/ArkFramework 依赖与 ArkImGui 准备脚本，新增标签触发且只建 draft 的 Actions；构建脚本支持 ImGuiDir，验证自动发现 MSVC/SDK。公开回归改用元数据声明子集，排除原始报告、完整 reference 和本地二进制；补 GPL/MIT 许可及打包清单。 | 本地依赖准备、九组 MSVC 测试与七个 TU 检查已通过；抽取夹具首次缺 DamageType enum 导致 ABI 测试红灯，补回真实声明后通过。Zig 0.17.0 构建、独立 DLL query 1.0.0/零前置插件依赖/禁用写 API 扫描、XLSX 独立检查及 actionlint 1.7.12 已通过；本地 DLL 1,416,704 字节，SHA256 7B950E9067AFD47C74AC04FB41A2499CE74C50037844D3DDA9EDB1AAFCAAA338。远程 Actions/草稿结果将在观察后另记；未操作游戏，实机验收边界未改变。 |
