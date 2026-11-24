@@ -2,7 +2,7 @@
 
 本文件面向继续开发本仓库的 agent。目标不仅是说明如何编译现有代码，还要保存足以重新实现插件的架构、数据语义、已验证入口、失败经验和游戏更新适配方法。
 
-- 文档基线：2026-11-16，源码版本 `common/stronghold_version.h` 中的 **1.0.1**（原内部 2.1.2 采集基线）。
+- 文档基线：2026-11-24，源码版本 `common/stronghold_version.h` 中的 **1.2.0**（保留原内部 2.1.2 采集基线；主界面显示只读种子/Boss 信息并新增商店记牌器，不保留出怪预览功能）。
 - 源码、当前客户端元数据及可复现测试优先于本文中的历史快照。更新实现后必须同步本文件，不能为了符合旧文档强行恢复旧结构。
 - 产品：仅适用于《明日方舟》卫戍协议的只读统计插件；支持 1–4 人本地模拟数据，不是通用伤害插件、独立注入器或游戏修改器。
 - 这份文档不代表已完成所有实机验收，尤其不能把模拟测试通过等同于当前游戏版本联机实测通过。产品契约是维护目标，不应误读成所有防护已经完备；当前实现的明确边界见第 9.1 节。
@@ -31,6 +31,7 @@
 - 对局外保留刚结束的一局用于查看；下一场会话开始才替换。当前缓存仅在插件内存中，卸载/重载不会自动从报表恢复。
 - 实际本地模拟集合覆盖全部在线房间玩家才称全房间；只有自己称本机；其余称部分采集。不按画质选项直接决定统计能力。
 - 1–4 人是产品边界；`kMaxPlayers = 8` 是内部容错容量，不代表支持 8 人房间。
+- 主界面直接显示只读获取的 `stageRandomSeed` 和由 `hiddenBossId` 解析的 Boss 名称。原始 Boss ID 留作内部查找键。不显示隐藏同步弹窗或逐轮出怪预览。`roundEnemies` 不采集、不输出。商店计数只消费准备状态中的货架/干员观察，不展示完整隐藏货架快照。字段缺失显示不可用。
 
 ## 3. 源码地图与重建模块
 
@@ -44,10 +45,12 @@
 | `common/unity_input.h/.cpp` | 浮层输入保护、原生输入 Hook 和卸载生命周期 |
 | `stronghold/types.h` | POD 事件、枚举、线程安全有界事件队列 |
 | `stronghold/capture_policy.h` | 会话身份、范围判断等可脱离游戏测试的策略 |
-| `stronghold/capture.h/.cpp` | NativeCapture：绑定元数据、8 个采集 Hook、归属、轮次/阶段/计时采样 |
+| `stronghold/match_intel.h` | 只读快照 POD：普通数据来源、隐藏种子/Boss 与准备状态商店观察；不包含敌人预览条目 |
+| `stronghold/shop_counter.h` | 纯逻辑记牌器：按玩家统计货架/盟约出现频率、观测到的获得/可关联商店来源、持有数和推定卖出 |
+| `stronghold/capture.h/.cpp` | NativeCapture：绑定元数据、8 个核心 Hook、归属、轮次/阶段/计时采样；可选 AllStateSync 与 PreparationStatus.Read 只读复制商店、种子和 Boss 信息 |
 | `stronghold/model.h` | 纯逻辑统计模型：整局、当前轮、历史轮、双阶段、去重与玩家时钟 |
 | `stronghold/view_state.h` | 只读 UI 范围/阶段/轮次选择，不驱动游戏状态 |
-| `stronghold/plugin.cpp` | 宿主生命周期、`pump_events()`、模型/报表协调、ImGui 浮层 |
+| `stronghold/plugin.cpp` | 宿主生命周期、`pump_events()`、模型/报表协调、伤害统计/记牌器页及主界面的种子/Boss 信息 |
 | `stronghold/csv_export.h` | 共用报表行语义和兼容 CSV；现有 UI 主导出不是 CSV |
 | `stronghold/xlsx_export.h` | 不依赖 Excel 的 C++ OOXML/ZIP-store/CRC32 生成器 |
 | `stronghold/report_archive.h` | 整局与逐轮快照、结束时间命名、失败重试与归档 |
@@ -57,7 +60,7 @@
 | `tests/fixtures/` | 公开回归用的元数据最小子集及显式 status/source 补充；无运行态/账户数据 |
 | `reference/current-schema/` | 本机私有原始证据（Git 忽略），不作为干净检出或 CI 的输入 |
 | `reference/dump-audit/` | 历史 dump 研究，仅作定位线索，不作当前偏移事实 |
-| `tests/` | 九组纯逻辑、模拟元数据和 ImGui 回归测试 |
+| `tests/` | 纯逻辑、模拟元数据、商店计数、隐藏同步快照和 ImGui 回归测试 |
 | `tools/inspect_binary.py` | PE/导出/依赖/旧功能及禁用写能力检查，含实际加载 query 检查 |
 | `tools/inspect_workbook.py` | 不依赖插件生成器的独立 ZIP/XML/XLSX 内容校验 |
 | `tests/test_inspect_workbook.py` / `tools/test-excel-workbook.ps1` | 独立校验器的匿名元数据反例；可选的已安装 Excel 原生只读打开检查 |
@@ -65,6 +68,7 @@
 | `tools/dependencies.lock.json` / `prepare-dependencies.ps1` / `package-release.ps1` | 固定工具链/ArkImGui 来源、干净检出准备与不捆绑宿主的发布包 |
 | `.github/workflows/release-draft.yml` | 历史文件名保留；标签校验、验证/构建、正式发布并核验 Latest |
 | `README.md` / `AUDIT.md` / `dist/部署说明.txt` | 面向用户的安装、操作、口径、导出与排障入口 / 历史修复证据 / 部署说明；源码构建、Actions 和升级适配细节由本文承载，改功能须同步相应文档 |
+| `SEED.md` | 客户端 seed、随机流、敌人生成和逐回合敌人数据的详细静态研究；明确可读取、可推导和待实机验证的边界 |
 
 ## 4. 从零准备与构建
 
@@ -139,7 +143,7 @@ third_party/il2cpp-mod-template/platform/il2cpp_module_windows.c
 ### 4.3 公开仓库与 Release 流程
 
 - 仓库为 git@github.com:Noplch0/ArkACT.git，默认分支 main；首次公开版本 1.0.0 对应标签 v1.0.0，已于 2026-11-16 正式公开发布。不重写已有远程历史、不移动已发布标签。
-- 当前公开 Latest 为 **v1.0.1**（2026-11-16），构建源 commit `3c33ea2787fb1d1322e0a38ef75d2ce6c437baf8`，Actions `43821344832` 成功。发布后的文档验证记录可继续提交 main，但不能据此移动版本标签或重传已验证的正式附件。
+- 当前公开 Latest 为 **v1.0.1**（2026-11-16），构建源 commit `3c33ea2787fb1d1322e0a38ef75d2ce6c437baf8`，Actions `43821344832` 成功；截至 2026-11-24，源码版本 1.2.0 已完成本地构建与验证但尚未发布，种子/Boss 主界面信息与商店记牌器均不在公开 v1.0.1 附件中。发布后的文档验证记录可继续提交 main，但不能据此移动版本标签或重传已验证的正式附件。
 - .github/workflows/release-draft.yml 保留历史文件名，显示名为 Release，监听 v* 标签，也支持 workflow_dispatch 的既有 tag；标签必须与版本头一致并指向构建 commit。固定第三方 Actions commit，Windows runner 自动发现工具链，并设置 PYTHONUTF8=1，避免英文 runner 打印中文 Sheet 名时因 cp1252 中断。
 - 用户于 2026-11-16 授权从 1.0.1 起不再停留为草稿，而是在验证通过后直接正式发布并设为 Latest。流程：锁定依赖 -> 九组测试/七个 TU -> Zig GNU x64 DLL -> inspect_binary/七项 Python/inspect_workbook -> tools/package-release.ps1 -> `gh release create --verify-tag --latest`。不带 `--draft`/`--prerelease`；验证/构建失败不进入发布步骤，已有同标签 Release（含残留草稿）拒绝覆盖，应先检查状态再决定恢复，不自动重传/替换正式附件。CLI 上传失败可能留下未完成 Release，必须检查，不盲目重跑或宣称成功。需要该 job 的 contents:write 权限，不需要额外个人 token secret。
 - 发布附件只有 ArkACT-v<版本>-windows-x64.zip 与 .sha256。ZIP 含 plugins/stronghold_stats.dll、部署/README、GPL 与精简后端 MIT 许可及 build-info.json（源码 commit、依赖、DLL hash/大小）；不捆绑 ArkImGui/宿主/注入器。DLL 的最终哈希以附件 build-info 和校验和为准，不把本机旧 DLL 哈希写成 CI 哈希。
@@ -183,11 +187,11 @@ third_party/il2cpp-mod-template/platform/il2cpp_module_windows.c
 - `TryGetValue(key, out value)` 的 out 存储大小由真实值类型决定：`ChessInst&` 对应指针大小，`Int32&` 才是 4 字节。
 - `runtime_invoke` 只用于经审查的只读 getter/集合查询；不得因为名字像 getter 就默认无副作用。不要调用 Ensure/Create/Set/Add 等玩法方法来“帮助”查询成功。
 
-### 5.2 当前元数据锚点与八个采集 Hook
+### 5.2 当前元数据锚点与八个核心采集 Hook
 
 核心类型：`Torappu.Battle.{Entity, Character, Projectile, Modifier, BattleLogger, BattleController, BattlePlayerData, BattleCharacterData}`、`Torappu.FP`；卫戍类优先位于 `Torappu.Battle.DataCenter` 与 `Torappu.Battle.AutoChess`，实际回退逻辑以 `bind_classes()` 为准。`ScenePlayerData` 是 `AutoChessPlayerDataModel` 的嵌套类，不是独立 namespace 类。
 
-`NativeCapture::bind_hooks()` 当前精确安装下列八个入口，全部是实例 `System.Void` 方法：
+`NativeCapture::bind_hooks()` 安装下列八个核心入口，全部是实例 `System.Void` 方法；另有一个可选、失败不影响核心采集的隐藏全状态解析 Hook：
 
 | 类 | 方法/参数 | 用途 |
 | --- | --- | --- |
@@ -199,6 +203,7 @@ third_party/il2cpp-mod-template/platform/il2cpp_module_windows.c
 | 同上 | `OnDestroy()` | 销毁生命周期兜底 |
 | 同上 | `Update()` | 游戏线程状态与时钟采样 |
 | `Torappu.GlobalInitializerAndUpdater` | `Update()` | Manager 尚未存在/消失时的全局生命周期采样 |
+| `AutoChessBattleAllStateSyncData` | `Read(Torappu.DataStream.IStreamReader)`（可选） | 只读复制协议隐藏字段；value-type `this` 原始指针，失败不影响核心八 Hook |
 
 框架 Hook ABI 只适用于已确认的 Windows x64 整数/指针寄存器参数形式（至多四个），不能把复杂结构体、浮点或栈参数方法直接套进同一 detour 模板。修改入口时连同原函数指针签名和 IL2CPP 附带方法参数约定一起核验。所有 Hook 的元数据/ABI 先完整解析，验证通过后才开始创建和启用；任一个关键入口不兼容就安全停采，不带病运行。
 
@@ -285,6 +290,11 @@ Modifier.source / originalSource
 - 行是否显示根据**所选阶段**的实际数据/时长和对应 live timing mask，不能拿另一阶段成员掩码显示一排假零玩家。
 - 表格使用剩余空间、固定表头并可滚动，详细说明进 popup；不要恢复占据底部的大块不可见 child 区域。
 - 局外只读显示上一局，不能因当前 AutoChessDataCenter 不存在就把缓存清空/窗口全隐藏。无数据且不在模式内时才按现有 UI 策略处理。
+- 插件已加载但尚无 Session 时，不得因 `statistics_visible()` 为 false 而完全隐藏窗口：显示同一 window ID 的局外等待状态，明确“正在连接/运行时已就绪，等待进入卫戍协议/版本不兼容”；只有已有历史 Session 时才显示统计表。该窗口不回退为猜数据，也不改变 Session 生命周期。
+- 主窗口以手动标签在“伤害统计/记牌器”间切换；新 Session 默认重置为伤害统计页。记牌器内可切换“出现频率/玩家干员”，出现频率再按“干员/盟约”查看，并可按 P1–P4 筛选。
+- 记牌频率按每个货架槽计数；同一有效 `refreshSeq` 的重复快照不重复统计，冻结货品在新序号中留在相同槽位时不重计。没有可用序号时按槽位内容变化降级计数并标记不完整；同结果刷新无法从快照差异中识别。干员频次同时累计到其全部基础盟约。
+- 玩家干员表按实际干员实例数显示获得、可确认的商店获得、推定卖出和持有。analytics 获得增量与持有增量取较大值而非相加；第一次看到的持有阵容作为基线。售出只由持有数下降推定，商店来源只在同一刷新序号下获得记录与货架槽位消失可对应时标记。无法关联的来源不猜；黄金/高星干员不折算为基础副本数。
+- 渲染线程只消费复制的 `ShopObservation`、`capture_hidden_sync()` 和 `capture_match_intel()` 快照，不能解引用 DataCenter、Character、List 或托管字符串；不得把原始 UID/昵称编号放入快照或导出。主界面显示当前 Session 的 `stageRandomSeed` 和与所选隐藏 Boss ID 匹配的名称。
 - UI 主导出为一个 XLSX：整局累计 Sheet + 每轮 Sheet，每张按战斗/协防分行；报表阶段文字实际为“主战/协防”，UI 按钮为“战斗/协防”。保留兼容 CSV 代码不意味着需要恢复 CSV 主导出。
 - 当前 15 列依次为：**阶段、维度、轮次、玩家槽位、玩家、干员、实例数、实际伤害、战斗时间(秒)、DPS、伤害占比、计算伤害、治疗量、HPS、元素损伤**。
 - 不导出原始 UID、昵称编号、干员 ID、统计范围或单独状态列；在线/中途退出等状态附在玩家显示名括号中。P1–P4 是房间槽位，不是账户昵称编号。
@@ -295,6 +305,58 @@ Modifier.source / originalSource
 - XLSX 实现是自包含 ZIP store + CRC32 + OOXML，无压缩库/Office/外部报表运行时依赖；改生成器时要同步独立解析检查，不仅测试“文件存在”。
 - **Excel 工作簿属性兼容性（1.0.1）**：`make_workbook_xml()` 不写可选 `fileVersion`。旧 `<fileVersion appName="xl"/>` 虽能通过 XML/ZIP 校验，却会让 Excel 16.0（本机 build 20527）正常打开失败，交互打开提示修复 `/xl/workbook.xml` 工作簿属性。保留实际 `workbookPr`、视图、Sheet、样式与数值；不要为修复它删除数据、隐藏警告或请求 Excel 自动修复。导出器不是 Excel，不伪造 Excel 编辑版本。独立检查器的受支持产物策略允许省略该元素；若存在，只接受同命名空间、直属且完整的已验证 Excel 版本属性组（`appName=xl` 与数值 `lastEdited/lowestEdited/rupBuild`），这不是完整 OOXML Schema 验证器。
 - XLSX 兼容性修复只影响新导出/重新导出文件，不自动扫描或重写用户旧报表。原始报表、真实玩家信息和本地复现副本不进入 Git。原生 Excel 检查仅是开发机的可选验证，不成为插件运行或无 Excel CI 的依赖；也不代表游戏实机验收。
+
+### 5.9 商店刷新机制的静态研究边界（非采集功能）
+
+本节记录 2026-11-22 对现有客户端元数据和本地静态反汇编的研究结论。它不改变统计插件的只读采集、归属、报表或发布契约；没有据此新增 Hook、请求发送或玩法写入。证据为 `reference/current-schema/stronghold-schema-4708.log`、`.build/analysis-2.0.7-methods.tsv` 及本次在 `.build/shop-analysis-2026-11-22/` 生成的静态反汇编。`.build` 内容仅为本地证据，不是干净检出的构建输入，也不进入公开 Release。
+
+- **联机权威边界**：`AutoChessBattlePreparationStatus.store` 随准备状态快照下发；商店状态字段与 `ShopData`/`AutoChessShopDataModel` 对应。`AutoChessBattleSceneShopRefreshUp` 和 `ShopUpgradeUp` 只有协议 ID、没有客户端随机种子/商品列表/价格参数，`ShopBuyChessUp` 只带 `slotId/isSpecial`，`ShopFrozeUp` 只带布尔值。因此商品生成、扣费校验、刷新结果和失败回滚不能仅凭客户端代码断言由本地决定；客户端可见的同名方法还普遍存在 XLua Hotfix 覆盖桩。
+- **状态模型**：`ShopData` 包含 `level`、`currentCoin`、`upgradePrice`、`refreshPrice`、`goodsType`、`freeRefreshCnt`、`specialRefresh`、`chessGoods`、`refreshSeq`；每个 `ChessGoods` 包含 `chessId/slotId/price/isFrozen`。`goodsType` 数值为 `NORMAL=0`、`COMB=1`、`BUFF=2`。`refreshSeq` 用于 UI 识别一次新刷新，不应被当作购买事务 ID。
+- **等级与槽位**：`ActAutoChessShopLevelData` 提供 `initialUpgradePrice/charChessCount/itemCount`；原生 UI 的槽位数是同一等级配置的 `charChessCount + itemCount`。最大等级取当前 mode 的 `shopLevelDataDict` 最大键；升级初始价由各等级 `initialUpgradePrice` 生成映射，实际价格以运行时 `upgradePrice/refreshPrice` 为准。技术文件未保存具体模式/赛季的等级表数值，不能把历史截图或通用自走棋经验写成当前常量。
+- **普通刷新（本地原生回退路径）**：`ReqShopRefresh()` 在未拖拽锁定时读取 `refreshPrice`；`currentCoin < refreshPrice` 直接返回。成功路径先清空商品列表、`refreshSeq++`、扣除 `refreshPrice`，再执行 `_RefreshShopData(false)` 并更新 DataCenter/UI；`_RefreshShopData` 随后按当前等级目标数量补货。`freeRefreshCnt` 是独立状态并由 UI 显示，但该原生回退没有直接按计数做免费扣减分支，免费次数最终如何结算必须以服务器/热更实现和局内观测为准。
+- **冻结的静态边界**：`ReqShopFrozen(bool)` 对当前商品列表逐项写入同一个 `isFrozen` 值；`AutoChessShopDataModel.allFrozen` 汇总为 UI 三态（全冻/部分/全解），协议下行 `ShopFrozeDn` 带 `uidIdx/isFrozen`。`_RefreshShopData` 内部另有“未冻结项移除、冻结项保留”的循环，但原生 `ReqShopRefresh()` 在调用它前已经清空整个列表，且这些方法存在服务器/XLua Hotfix 覆盖。因此现有静态代码只能证明“逐项冻结状态和 UI 语义”，不能单独证明手动刷新后冻结项必保留；该跨刷新规则需用当前联机状态或热更实现确认。
+- **升级**：本地回退在金币不少于 `upgradePrice` 时只提升一级，从下一等级配置取新的 `initialUpgradePrice`，并走升级后的商店状态更新；等级表没有下一级时不升级。联机只发送 `ShopUpgradeUp`，由服务器重算价格、等级和商品。
+- **特殊/奖励货架**：本地 `_RefreshBonusShop()` 在普通货架状态下将 `goodsType` 设为 `COMB(1)`，清空普通商品后按 `min(当前等级 + 1, 训练配置上限)` 选择特殊商品，最多补 3 个槽；`specialRefresh`/`isSpecial` 是独立于普通刷新的状态与购买参数。该路径首先在训练/本地模拟桥接中确认，不能直接套用到所有联机模式。
+- **轮次刷新**：本地 `_MoveToNextRound()` 推进轮次后调用 `_RefreshShopData(false)`，所以进入新一轮准备阶段会执行普通补货，冻结项仍按上述规则保留。联机准备阶段由 `AutoChessBattlePreparationStatus` 整体同步，客户端不再以本地生成结果为准。
+- **随机与概率未知**：商品候选关联 `ActAutoChessCharShopChessData`、`ActAutoChessTrapShopChessData`、`shopLevelDataDict` 和 `AutoChessRandomWrapper`，但当前公开/私有技术文件没有给出各等级概率权重、候选池去重规则、玩家共享池或保底表。不得从类名、字段顺序或通用自走棋规则推导具体百分比；若后续需要精确概率，必须补充当前客户端的实际配置表或协议/局内抓取证据，而不是继续猜测静态偏移。
+
+### 5.10 对局种子、怪物生成与 ban 信息的可读边界
+
+- **存在可读的种子字段**：活动存档 `PlayerAutoChessV1Activity.AutoChessGame.seed` 有 `seed:Int32`；场景数据 `SceneGameData.stageSeed` 有 `stageSeed:Int32`；战斗中心暴露 `AutoChessDataCenter.stageRandomSeed`，战斗控制器另有 `BattleController.randomSeed`（内部为 `ObscuredInt`）和 `randomImp/randomTrivial` 两个随机流。它们不是同一个字段，不能默认认为数值相同。
+- **场景 seed 的可验证消费点**：`AutoChessDataCenter.InitData(SceneGameData, ScenePlayerStaticData)` 会复制 `SceneGameData.stageSeed` 到 `stageRandomSeed`，随后以该值调用 `BattleController.ResetSeed(int)`。原生 `ResetSeed` 通过 `BattleRandomFactory.Create(int)` 创建/替换 `randomImp` 与 `randomTrivial`，并重置 PRD 随机状态。因此 `SceneGameData.stageSeed` 是**本地可读取且确实参与战斗随机流初始化**的最明确种子。
+- **活动 seed 的边界**：`AutoChessGame.seed` 是活动/对局存档的一层字段，但现有技术文件没有给出它到 `SceneGameData.stageSeed` 的完整赋值链，不能断言二者相等，也不能把它当作当前局内唯一根种子。
+- **怪物种类**：`SceneGameData.enemyTypes` 是显式字符串列表，和 `stageSeed` 并列存在；`AutoChessDataCenter.InitData` 会复制它。`AutoChessLevelEnemyManager.Init` 再初始化 `RandomEnemyGenerater` 并生成 round enemy data。也就是说，怪物生成同时依赖显式 `enemyTypes`/关卡配置和随机流；只知道 `stageSeed` 不足以独立算出最终怪物列表，还需要完整配置、轮次、RNG 调用顺序和服务器下发的显式数据。
+- **盟约 ban 位**：`SceneGameData.bannedBonds` 与 `SceneGameData.selfBannedUnits` 是显式列表，`AutoChessDataCenter` 分别有 `bannedBonds` 和 `selfBannedUnits` 属性；`InitData` 直接复制这些列表。现有客户端文件没有展示从 seed 本地重新计算 ban 位的算法，因此应把它们视为服务器/场景输入结果；不能仅凭 seed 复现或断言 ban 位由客户端随机决定。
+- **其他随机器**：`AutoChessRandomWrapper.Reset(int)` 会用 `LegacyRandom(seed)` 初始化并生成缓存，说明它是可种子化的独立随机器；但现有调用链没有直接证明所有 wrapper 都由同一个 `stageSeed` 初始化。`BattleController` 的 `randomImp/randomTrivial` 与 AutoChessRandomWrapper 也不能混为一谈。
+- **协议中的可见性**：`AutoChessBattleSceneAllStateSyncDn.allStateSyncData` 的字段包含 `stageSeed`、`bannedBonds`、`enemyTypes` 和 `staticPlayers`；`AutoChessBattlePlayerStaticInfo.bannedUnits` 另有每个静态玩家的 ban 单位列表。因此只要已经获得客户端可解析的全状态同步数据，seed、怪物类型集合和 ban 列表是直接可读字段，不需要从 seed 反推。未授权解密、绕过传输层保护或修改/伪造协议不属于本项目工作范围。
+- **在线与本地来源**：`AutoChessBattleSceneAllStateSyncDn` 是服务器下发协议，`AutoChessBattleAllStateSyncData.Read` 从下行数据读取 `stageSeed`，所以联机对局的 `stageSeed` 来源是服务器。另有 `AutoChessDataBridgeLocalPlayer.GenerateLocalSave` -> `_GenerateTrainingData` 的本地教学/模拟构造路径，不能把该本地路径的生成规则套到联机房间。
+- **一局中可见的种子/结果目录**：活动存档层 `AutoChessGame.seed`；场景层 `SceneGameData.stageSeed`；数据中心副本 `stageRandomSeed`；战斗控制器当前 `randomSeed` 及其 `randomImp/randomTrivial`；另外有可独立设置种子的 `AutoChessRandomWrapper`。它们不是固定数量的同一个 seed，必须分层记录。显式结果或输入还包括 `stageId/modeId/bossId/hiddenBossId`、`enemyTypes`、`bannedBonds`、`staticPlayers[].bannedUnits`、玩家阵容与 `store`；这些字段可以直接缩小范围，但不应伪装成从 seed 精确计算。
+- **结论**：本地“能读到种子”是事实，但不能把单个整数当成“整局行为根因/可离线重放的完整钥匙”。若要做到可复现，需要同时保存：活动/场景 seed、`stageId`、模式、`enemyTypes`、`bannedBonds`、`selfBannedUnits`、当前轮次、客户端版本与配置，以及实际 RNG 流；其中 ban 和 enemyTypes 的直接值不能由现有客户端代码从 seed 反推。即使拥有 seed 和全状态快照，玩家操作、服务器校验和其他 RNG 消费者的时序仍影响最终对局。
+- **战斗随机流的轮次派生**：`AutoChessGameManager.DoLoadGameInternal` 读取 `stageRandomSeed` 和 `currentRound`，在战斗状态下以 `stageRandomSeed + currentRound` 构造 `AutoChessRandomWrapper`，再通过 `BattleController.ResetImpRandom` 替换 `randomImp`；初始 `ResetSeed(stageSeed)` 还创建/重置 `randomTrivial` 和 PRD 状态。直接调用 `randomImp` 的游戏侧消费者包括 `RandomEnemyGenerater._GenerateRandomEnemyData/_GenerateSpecialEnemyTypesLocal`、`AutoChessEnemyPreviewManager._DoSpawnPreviewEnemy`、`AutoChessGarrisonManager` 的随机羁绊选择、`AutoChessDataBridgeLocalPlayer._GiveChessViaShopLevel`、`AutoChessAdvancedSelector` 以及通用技能/目标/弹道随机逻辑。活动层 `AutoChessGame.seed` 的客户端直接消费者仍未找到，不能声称其精确控制字段。
+- **`randomTrivial` 与 PRD 的边界**：`randomTrivial` 的直接消费者主要是投射物初始化、随机效果旋转、随机发射器选择、部分移动/位置和部分场景元素；这些是通用战斗随机系统，是否在某一 AutoChess 干员/效果中实际触发取决于该功能是否调用。`ResetSeed` 同时调用 `RandomExtensions.ResetPRDRandom`，而 `DicePRD` 使用独立的 PRD 实体/类别状态；`stageSeed` 只能确定其重置/初始随机状态，具体概率效果由实际 `DicePRD` 调用者决定。
+- **随机敌人数据结构**：`RandomEnemyGenerater` 持有 `m_randomNormalEnemyResult`、`m_randomEliteEnemyResult`、`m_randomSpecialEnemyResult`、`m_specialEnemyTypeResultTypeList` 和 `m_templateEnemyInfo`。`AutoChessRandomEnemyAttributeData` 的候选字段为 `enemyKey`、`level`、`extraEnemyIdentifier`、`extraEnemyKeyList`、`isFlyEnemy`、`enemyBattleEffectivenessFactor`；`AutoChessEnemyTypeData` 还有 `type`、`typeIdentifier`、`involveRandom`。这些结构把“随机敌人数据”定义为可选敌人键、等级/附加敌人信息、飞行属性和战斗效能参数，而不是仅一个敌人数值。
+- **特殊敌人类型与配置**：`AutoChessSpecialEnemyType` 的枚举为 `NONE/FLY/TIMES/ELEMENT/DOT/INVISIBLE/REFLECTION/SPECIAL`；`AutoChessRandomEnemyType` 分为 `NormalWalk/NormalFly/EliteWalk/EliteFly/SpecialWalk/SpecialFly/NonTemplateWalk/NonTemplateFly`。特殊敌人配置 `ActAutochessSpecialEnemyTypeEntry` 提供 `count/countSingle/weight/showEnemyId`，`ActAutochessSpecialEnemyEntry` 提供 `type/specialEnemyKey/randomWeight/isInFirstHalf/attachedNormalEnemyKeys/attachedEliteEnemyKeys`。实际敌人 key 和具体权重由模式配置表/活动数据决定，当前 schema 不包含当前赛季的具体表值。
+
+### 5.11 隐藏全状态同步（1.1.0）
+
+全状态同步只读 Hook 不参与伤害排名、计时、会话身份或玩法写入。它用于复制 `stageSeed`、`hiddenBossId` 及所有玩家准备状态字段；`AutoChessBattleAllStateSyncData.Read(Torappu.DataStream.IStreamReader)` 是 value-type 实例方法，原生入口的 `rcx` 是原始结构指针、`rdx` 是 reader；Hook 调用原函数后，按字段元数据减对象头读取并复制，再发布互斥保护的 `HiddenSyncSnapshot`。
+
+- **根字段**：`hiddenBossId/stageSeed/staticPlayers/sceneDetail`。其中 raw offsets 由 `il2cpp_field_get_offset - 2 * sizeof(void*)` 得到；不能写死 RVA/偏移。
+- **保留字段**：同步快照可复制 `bannedUnits`、`preparationStatus.store`、`charChess` 与 `roundAnalytics.chessGained`，但面板不渲染 ban 或完整货架；`sceneDetail.roundEnemies` 不再读取/展示。
+- **Boss 名称**　游戏线程从 `AutoChessDataCenter.gameData` 读取 `Torappu.AutoChessData.bossInfoDict`，按隐藏 Boss ID 查询 `AutoChessBossInfoData`，使用 `enemyId` 或 `handbookEnemyId` 查询 `EnemyHandBookDB.get_data()` 所给图鉴数据的 `enemyData` 字典，读取 `EnemyHandBookData.name`。活动 `ActAutoChessData.bossInfoDict` 的条目描述权重和血量等活动配置。两个 `TryGetValue(String, …&)` 的字符串参数直接传托管引用，输出引用传地址。仅有同步 ID 时，从同一 Boss 字典中有界读取匹配的已有键。图鉴绑定失败不影响核心采集。
+- **主界面显示**　显示当前 Session 的种子和 Boss 名称。名称快照的 ID 必须与当前选中的隐藏 Boss ID 一致。已读到 ID 但缺名称时显示「名称未读取」，缺 ID 时显示「不可用」。普通可见阵容/货架不重复呈现。
+- **可选边界**：`AutoChessBattleAllStateSyncData.Read` 不是核心兼容门槛；类/字段/方法/宿主 Hook API 缺失时只禁用对应快照功能，八个伤害/生命周期 Hook 仍可运行。字段缺失不得用 0/空值伪装正常。
+- **隐私/线程**：快照不得保存原始 UID/昵称编号；回调线程按需附着 IL2CPP，所有 managed 访问在回调内完成，渲染线程只读复制数据。Hook 不调用 `Write`、刷新、购买、冻结、`Ensure/Create/Set/Add` 或任何玩法/网络写入口。新对局切换 Session 后清理记牌数据，离开模式保留当前局供查看。
+
+### 5.12 商店记牌器（1.2.0；功能引入于 1.1.1）
+
+- **观察入口**：`refresh_match_intel()` 将本机 `AutoChessDataCenter.shopDataModel.chessGoods` 的可读货架独立发布为 `ShopObservation`。可选的 `AutoChessBattlePreparationStatus.Read(IStreamReader)` 在原函数完成后复制单玩家准备状态。AllStateSync 回调也复制内嵌的 `preparationStatus`，覆盖可能只在全状态同步中出现的队友状态。三个入口共享有界队列，由 `ShopCounter` 消费。
+- **名称和身份**　协议 `chessIdentifier` 从本局 `ActAutoChessData.charChessDataDict` 的 `identifier` 对齐棋子，原生 `GetChessBasicInfo(Int32)` 的参数属于部署实例 `instId`。本机 `ChessGoods.chessId` 优先采用 `GetChessBasicInfo(String)` 的干员和基础盟约信息，也可按棋子 ID 匹配活动配置。采集在游戏线程从 `charShopChessDatas` 读取角色 ID，调用 `CharacterUtil.GetCharName(String)` 取名称，并用 `bondInfoDict` 取 `ActAutoChessBondInfo.name`。`GetBondInfo(String)` 按返回类型绑定嵌套配置作为本机描述路径。`trapChessDataDict` 可排除已确认的其他商品。缓存只保留复制后的数据，随新局替换。界面仅用 ID 聚合，缺名称时显示「干员名称未读取」或「盟约名称未读取」。同键后续获得名称可补齐已有统计行。
+- **去重与频率**：以玩家槽和轮次分桶，有序号时按 `refreshSeq` 划分货架。同序号内相同槽位的同一干员只记一次，新槽位或新商品可补计，序号不变却产生新记录时标为不完整。序号递增时统计新货架，同一干员前后均冻结并留在同槽时跳过。过期序号不回滚货架，序号回退或跳跃标为不完整。缺序号时按相邻货架槽位内容变化降级统计，缺有效槽位时用列表顺序。相同结果的刷新可能漏记。
+- **跨回合冻结**：每位玩家的首个有效货架快照以其上一相邻回合最后观察到的冻结商品为基线。开局货架分批观察时，仍按同玩家、同槽位、同干员且前后均冻结识别保留商品，干员和盟约频次都沿用原计数。每个槽位首次观察到可识别的商品后消耗匹配资格，确认本轮刷新序号递增后清除剩余资格。上一回合没有有效基线时，按首次观察计数。
+- 干员和盟约的出现频率按所选玩家范围取值并降序排列。选「全体」时显示已采集货架的合计和 P1–P4 分列。选单个玩家时只显示在其货架出现过的条目及其出现次数。
+- **获得/持有/售出**：`roundAnalytics.chessGained` 的元素为 `AutoChessBattleChessCountInfo`，`charChess` 的元素为 `AutoChessBattleCharChess`，两个类型分别绑定 `chessIdentifier`。轮内累计获得增量与持有数量增量按干员取最大值，首次持有快照只设基线。持有数下降累计为“推定卖出”，可能包含其他减少原因。只有持有/获得增加与同序号货架槽位消失相匹配时才记“其中商店”。所有数量按干员实例数。
+- **范围和边界**：统一显示为 P1–P4，名册含 0 且不含 4 时启用零基槽位兼容，协议槽位与名册的对应关系仍待实机核对。队友只在本机实际可读他们的准备数据时纳入。本机定时采样可能跳过两次采样之间的刷新。数据仅在插件内存中保留，队列溢出和刷新序号缺口会标为不完整。
 
 ## 6. 游戏更新后的适配流程
 
@@ -405,6 +467,8 @@ Select-String -Path 'stronghold\capture.cpp' `
 | --- | --- | --- |
 | 局外/结束后 NullReferenceException | 是否直接读 DataCenter singleton；比较 LAST COMBAT 与 CURRENT | 给空指针硬填地址、在 UI 线程强读玩法对象 |
 | 能读自己昵称，但伤害全 0 | applied 命中、outside_mode、endingStatus 误判、realDelta 读取时机 | 认为昵称正常就元数据全兼容，改用 calculated 冒充实际伤害 |
+| 刷新商店后出现频率仍为空，或有干员行但无盟约行 | 核对加载的 DLL 哈希、`localShopShelf` 和 `localShopDescriptors` 绑定、`shop observations` 的 `local/hidden/rejected`、P1–P4 筛选。`local` 增长表示采到货架观察，还须确认其中有有效干员条目。干员已有记录时单独检查盟约描述映射 | 把空快照当成统计零次，或按采样次数冒充刷新次数 |
+| 记牌器提示名称未读取 | 核对 `shopOperatorName`、`shopBondName` 绑定与本局活动配置。协议编号应与 `charChessDataDict.identifier` 对齐，并通过 `charShopChessDatas` 匹配角色 ID | 将部署实例 ID 用来查协议条目，或将内部 ID 当成显示名称 |
 | 高画质仍只有自己 | 玩家 raw 1–4、真实 ChessInst 集合、索引就绪时序、TryGetValue out ABI、覆盖 mask | 从画质/房间名单造队友零数据，强制 badge 为全房间 |
 | DoT 少计或完全消失 | 是否错误按地址/相同数值去重、originalSource/宿主链、主入口 | 在 UI 单加一个 DoT 估值或跨 tick 去重 |
 | 同次伤害翻倍 | applied 内 Logger 是否被抑制，sequence 是否重放 | 按相同伤害大小统一除二 |
@@ -463,16 +527,17 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 
 检查至少包括 x64 PE32+、四个导出、ABI/版本、dependency_count=0、无 damage_meter/RDPS、导入白名单、无禁用的 IL2CPP setter/创建/状态 Ensure 符号。符号扫描不是完整安全证明，仍需代码审查 `runtime_invoke` 调用的语义，确认没有新增游戏写功能。
 
-### 7.2 九组回归测试各自保护什么
+### 7.2 回归测试各自保护什么
 
 | 测试 | 主要保护范围 |
 | --- | --- |
 | `stronghold_model_tests.cpp` | 1/2/4 人聚合、玩家/干员隔离、整局/本轮、双阶段与独立时钟、退出冻结、队列/sequence/重置 |
-| `stronghold_capture_tests.cpp` | 生产采集代码的模拟运行时：归属/来源/DoT、Hook 嵌套、时机、会话/轮次、计时和生命周期 |
-| `stronghold_schema_tests.cpp` | 真实报告与显式 source/status 静态补充重放、当前 binder、八个 Hook 的元数据前置验证及不兼容负例 |
+| `stronghold_capture_tests.cpp` | 模拟生产采集代码的归属/来源/DoT、Hook 嵌套、时机、会话/轮次、计时和生命周期，覆盖隐藏同步快照及 Boss ID 到图鉴名称的解析、仅同步 ID、图鉴别名回退与缺项 |
+| `stronghold_schema_tests.cpp` | 真实报告与显式静态补充重放，覆盖核心 Hook、可选同步 Hook、本机货架、干员描述两个重载，以及持有和获得的不同元素类型 |
 | `il2cpp_runtime_tests.cpp` | 元数据查找、签名/继承、类型/集合与运行时安全边界 |
 | `metadata_report_tests.cpp` | mock GameAssembly 导出解析、报告完整性/兼容性与隐私边界，不加载真实游戏 |
-| `stronghold_ui_tests.cpp` | ImGui 实际按钮/布局、选择生命周期、阶段成员、局外可见、历史与滚动 |
+| `shop_counter_tests.cpp` | 多槽干员/盟约频率、跨刷新和跨相邻回合冻结槽去重、分批货架及基线失效、重复及过期快照、缺失或不变的刷新序号、获得与货架匹配、持有基线、推定售出、全体/单玩家频率取值与排序和 Session 重置 |
+| `stronghold_ui_tests.cpp` | ImGui 实际按钮/布局、选择生命周期、阶段成员、局外可见、历史与滚动、Boss 名称显示及 ID 不一致时的回退、记牌器和玩家范围切换后的频率读数 |
 | `stronghold_csv_tests.cpp` | 共用行语义、兼容 CSV 转义/中文/零分母、隐私列等回归 |
 | `stronghold_xlsx_tests.cpp` | ZIP/CRC32、OOXML、多 Sheet、15 列、中文、百分比、文本安全、原子写入/失败；不生成使 Excel 修复的应用版本记录 |
 | `stronghold_report_tests.cpp` | 多轮归档、结束时间固定、同分钟冲突、进行中/中断、失败保留重试与默认写入器集成 |
@@ -540,6 +605,7 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 2. **部分注册失败的回滚**：`initialize()` 先注册 frame 再注册 draw；若前者成功、后者失败，本地失败分支没有保存句柄并显式 remove_callback 已注册项。最终是否由宿主 owner 清理由框架加载失败契约决定，不能把本地分支描述为完整事务回滚；后续适配宿主必须核查这一契约。
 3. **来源边界（2.1.2 已部分修复）**：已增加来源失败回退、动态宿主缓存、来源对象 side 的验证映射，以及实际 Enemy 无来源承伤的未归属保留和一次告警。仍不声称任意脚本效果均可恢复：没有实际 Enemy 目标或可信友方来源、敌方非 Enemy Token、Hook 链外直接改血、完全失去宿主身份等仍需新局内诊断/对应干员盟约验证。无来源未知项可能包含环境承伤，不能当成某位玩家输出，也不能把 unresolved_source 全部盲加给自己。
 4. **有限去重保证**：sequence 是队列回放游标，不是全局事件身份。当前 applied 调用范围抑制解决已知嵌套 Logger，不能承诺跨线程、任意新入口或重复 publish 都会自动幂等。新增入口必须重做同次/跨 tick 对照测试。
+5. **隐藏同步/记牌器边界（1.2.0）**：普通 DataCenter 只保留本机完整货架和 `selfBannedUnits`。可选 AllStateSync `Read` 与 PreparationStatus `Read` 可复制全状态/单玩家准备状态。主 UI 显示种子和隐藏 Boss 名称，原始 Boss ID 留作查找键。逐轮出怪预览 UI/本地敌人缓存采集已移除。商店历史只有在相应状态实际被本机观察到时才计数，冻结、序号缺口、来源/售出推定边界见 5.12。新 Hook 的回调线程、准备状态更新频率、队友货架覆盖、名称解析和购买/售出推断准确度均待当前客户端实机验证。
 
 ### 9.2 文档维护记录
 
@@ -559,3 +625,24 @@ Get-FileHash '.\dist\plugins\stronghold_stats.dll' -Algorithm SHA256
 | 2026-11-16 | 复核 GitHub 公开可见性口径，已复核，无技术变更：公开仓库与公开 Release 的既有脱敏审计结论仍适用，未发现游戏 UID、昵称编号、个人邮箱、令牌或本机 Windows 用户名；公开的 GitHub 账号用户名及 noreply 提交/标签身份属于预期元数据。 | 本次仅解释既有审计边界，未重新联网复核远端、未编译/测试、未修改生产源码或产物、未部署/重载或操作游戏。本地忽略目录中的 PDB、日志、会话哈希和 XLSX 玩家显示名仍只在本地，分享整个工作目录前需排除。 |
 | 2026-11-16 | 按用户授权将 1.0.1 发布流程从仅建草稿改为正式 Release/Latest，保留工作流文件名，加入发布后标签、附件名、公开状态及 Latest API 核验；更新发布说明与部署文档，准备提交既有 Excel 兼容性修复。 | 本轮 actionlint 1.7.12、七项 Python 回归、XLSX 独立校验、实际 DLL query=1.0.1/零前置插件依赖检查通过；本机临时目录测试需在沙箱外执行，权限恢复后通过，未改业务测试。公开树与全部 97 个 Git 对象（71 个 blob，含不可达内容）、refs/reflog 规则扫描通过；远端 main 与本地基线一致，v1.0.1 尚未存在。正式发布及远端 CI/附件核验在观察后另记；未操作游戏或部署。 |
 | 2026-11-16 | 1.0.1 正式发布完成：main 与新标签原子推送，构建 commit 3c33ea2；Actions 43821344832 成功并以 github-actions[bot] 正式发布，API 确认非草稿/非预发布，Latest 指向 v1.0.1，两附件 uploaded；1.0.0 标签与公开附件保持不变。 | 远端九组 C++/七个 TU/七项 Python、Zig、DLL/XLSX 独立检查及发布全部通过。重新下载 ZIP 后核验 CRC、允许清单、build-info 源 commit/大小/哈希，实际加载 CI DLL query=1.0.1、零前置插件依赖/禁用写能力扫描通过；CI DLL 1,416,192 字节，SHA256 F9DB274F098BE0B32F02F3D541E22F9BDB166E10963907114FF9779B2C06AD89；ZIP 611,276 字节，SHA256 50F305F2DBD2932FD23A59B1A28416189818FD7A50665E46AB7756C5C7CB6CA6。已检查当前/既有 Actions 日志、Release 正文、公开附件与 Git 全对象/refs/reflog，无规则发现；本地忽略目录仍不公开。此处补录验证只更新 main，不移动标签或更换 Release；未操作游戏/部署，游戏内导出仍待用户安排验证。 |
+| 2026-11-22 | 新增 5.9 商店刷新静态研究边界：区分联机服务器权威状态与本地教学桥接，记录普通刷新/冻结/升级/特殊货架/轮次刷新和 `refreshSeq` 语义；明确概率、免费次数最终结算及具体等级表数值仍缺证据。仅更新文档，未改插件源码、版本或 DLL。 | 复核元数据报告 4708、方法映射与本地静态反汇编；确认协议请求字段和原生回退路径，未运行编译/业务测试，未部署、重载、附加调试器或操作游戏；联机实机与配置概率仍待验证。 |
+| 2026-11-22 | 新增 5.10 对局种子边界：确认 `SceneGameData.stageSeed` 会被 `AutoChessDataCenter.InitData` 传入 `BattleController.ResetSeed`，活动层 seed 另有字段；明确 `enemyTypes`、`bannedBonds`、`selfBannedUnits` 是显式场景输入，种子不能单独替代完整配置和 RNG 调用序。仅更新文档。 | 复核当前元数据、方法映射与 `AutoChessDataCenter.InitData`/`BattleController.ResetSeed` 静态反汇编；未编译、未测试、未部署、未重载或操作游戏；完整对局/联机随机复现仍需实机证据。 |
+| 2026-11-22 | 补充种子协议可见性：`AutoChessBattleSceneAllStateSyncDn.allStateSyncData` 直接包含 `stageSeed`、`bannedBonds`、`enemyTypes`，静态玩家条目包含 `bannedUnits`；说明这些字段可通过已解密的全状态同步读取，但不会提供绕过鉴权/传输保护、篡改数据或作弊的实现。 | 复核元数据字段和协议声明；未抓取网络包、未解密流量、未编译/测试、未部署、未重载或操作游戏。预测能力仍受客户端版本、配置、RNG 消费顺序、服务器校验和玩家输入限制。 |
+| 2026-11-22 | 补充来源判断：联机 `stageSeed` 由服务器经 `AutoChessBattleSceneAllStateSyncDn` 下发并由 `AutoChessBattleAllStateSyncData.Read` 读取；本地教学/模拟另有 `GenerateLocalSave`/`_GenerateTrainingData` 构造路径。未改变只读边界。 | 复核协议类型、字段声明和现有静态反汇编；未抓取/解密网络流量，未编译/测试、未部署、未重载或操作游戏。实机网络封装是否明文仍待验证。 |
+| 2026-11-22 | 补充一局种子/结果目录：区分活动 seed、场景 `stageSeed`、`stageRandomSeed`、`BattleController.randomSeed` 和独立 `AutoChessRandomWrapper`；将 `enemyTypes`、ban、静态玩家阵容、Boss/场景字段列为可直接缩窄范围的显式信息，不把候选范围或历史结果说成 seed 的精确预测。 | 复核 `AutoChessGame`、`SceneGameData`、`AutoChessBattleAllStateSyncData`、`AutoChessLevelEnemyManager` 与 `BattleController` 的字段和方法声明；未抓包、未实机验证、未编译/测试或操作游戏。配置权重和完整 RNG 消费顺序仍未知。 |
+| 2026-11-22 | 深入核对种子消费者：确认战斗加载时主 `randomImp` 使用 `stageRandomSeed + currentRound` 构造 `AutoChessRandomWrapper`；静态调用图显示其覆盖随机敌人/特殊敌人、敌人预览、随机羁绊、商店等级赠棋、随机选目标及通用技能/目标/弹道随机。活动层 seed 未找到客户端直接消费者。 | 复核 `AutoChessGameManager.DoLoadGameInternal`、`BattleController.ResetSeed/ResetImpRandom`、`RandomEnemyGenerater` 等静态反汇编并对 `BattleController.randomImp` 做直接调用者扫描；未运行游戏、未抓包、未编译/测试、未部署或重载。服务器端活动 seed 和完整权重表仍待证据。 |
+| 2026-11-22 | 已复核 seed 可决定的随机行为清单，无技术变更：场景 seed 初始化 `randomImp/randomTrivial/PRD`，战斗主随机流按 `stageRandomSeed + currentRound` 派生，覆盖随机敌人、特殊敌人、敌人预览、随机羁绊、商店等级赠棋及通用战斗随机。 | 仅按既有 5.10 静态结论作答；未运行分析工具、编译/测试、抓包、部署或游戏操作。 |
+| 2026-11-22 | 补充 `randomTrivial`/PRD 解释：前者用于投射物、随机旋转/发射器、移动位置和部分场景元素等通用随机；后者是 `DicePRD` 的概率分布状态，具体触发由实际调用者决定。仅文档更新。 | 复核既有直接调用者扫描和 `ResetPRDRandom/DicePRD` 方法声明；未运行分析工具、编译/测试、抓包、部署或游戏操作。 |
+| 2026-11-22 | 细化随机敌人结构：记录 `RandomEnemyGenerater` 的普通/精英/特殊随机结果与模板结果字段，`AutoChessRandomEnemyAttributeData` 的敌人键/等级/附加敌人/飞行/效能因子，以及 `AutoChessSpecialEnemyType` 和 `AutoChessRandomEnemyType` 分类、特殊敌人 count/weight/attachment 配置。 | 通过元数据字段探针和 `RandomEnemyGenerater` 静态反汇编核对；未读取具体赛季表值、未实机验证、未抓包、未编译/测试、未部署或操作游戏。 |
+| 2026-11-22 | 已复核种子职责说明，无技术变更：`stageSeed` 初始化战斗随机流，影响怪物与随机战斗行为；显式 `enemyTypes`、ban 列表不由客户端 seed 推导；活动 seed 和独立随机 wrapper 的完整作用域仍未证实。 | 仅压缩并复核既有 5.10 结论；未运行工具分析、编译/测试、抓包、部署或游戏操作。 |
+| 2026-11-22 | 1.1.0：隐藏同步 UI 按用户反馈收窄。保留可选只读 AllStateSync Hook 与内部快照，但 UI 只显示 `stageRandomSeed`、`hiddenBossId` 和同步状态；`bannedUnits`、所有玩家完整货架、`sceneDetail.roundEnemies` 明确不显示。确认 `roundEnemies` 是某一轮的敌人预览/生成输入，不是实时刷怪日志。补字段抑制 UI 回归和 schema 第 9 Hook 验证；不添加抓包、预测或玩法写入。 | `verify.ps1` 九组 MSVC 回归、七个生产 TU、隐藏 capture/UI 回归和 9 Hook schema 回归通过；Zig 0.17.0 构建成功；`inspect_binary.py` 实际 query=1.1.0、零前置插件依赖、无禁用写/创建/状态初始化 API；七项工作簿独立校验通过。DLL 1,465,856 字节，SHA256 `B38B11A93AB5669C71F59A952FEB79E66240047E0DBF6B9C26EA64C72DE768ED`。未部署、重载、关闭/附加游戏或抓包；AllStateSync Hook、回调线程、实际包频率和隐藏字段可用性仍待实机验证。 |
+| 2026-11-22 | 1.1.0：修复插件启动后未进入首局时无界面。新增 `draw_idle_window()`：插件加载后即显示同一窗口 ID 的连接/等待状态，运行时和输入就绪后提示等待进入卫戍协议；进入首个 Session 后切换统计窗口，历史局外数据仍显示统计表。补 idle window UI 回归。 | `verify.ps1` 九组 MSVC 回归、七个生产 TU、idle window/隐藏同步 UI 回归通过；Zig 0.17.0 构建成功；`inspect_binary.py` 实际 query=1.1.0、零前置插件依赖、无禁用写/创建/状态初始化 API；七项工作簿独立校验通过。DLL 1,465,856 字节，SHA256 `B38B11A93AB5669C71F59A952FEB79E66240047E0DBF6B9C26EA64C72DE768ED`。未部署、重载、关闭/附加游戏或抓包；实际游戏启动时序、首局 Session 和窗口表现仍待实机验证。 |
+| 2026-11-23 | 新增 `SEED.md`：按客户端证据分层记录活动 seed、场景 `stageSeed`、DataCenter 副本、`BattleController.randomSeed`、每回合 `stageRandomSeed + currentRound` 派生主随机流，以及 `randomTrivial`/PRD；详细整理 `RandomEnemyGenerater`、`AutoChessLevelEnemyManager`、`roundEnemies` 的生成/预览/实际战斗调用链，区分“读取已生成数据”和“仅凭 seed 计算”，并列出权重、服务端权威、RNG cursor、未来回合等未决边界。 | 仅新增和同步文档；检查 UTF-8、Markdown 代码围栏/结构、文件差异和文档链接，不运行游戏、不抓包、不编译、不部署、不重载或修改玩法数据。未把静态推导写成实机结论；当前赛季权重、服务端 roundEnemies 权威、回调/包频率和逐回合预生成策略仍待实机验证。 |
+| 2026-11-23 | 新增“出怪预览”标签页：AllStateSync `roundEnemies` 按回合优先，本地已生成 `m_roundEnemyData` 补缺，`m_allBattleLevelIds` 提供回合目录；新 Session 清除旧表。显示原始 `enemyKey`/条目 `count`，缺项/缺数量明确未知，不从 seed 预测、不调用敌人生成逻辑，也不把预览数等同战斗最终刷怪数。工作区版本标为 1.1.1，仅本地构建、未发布；公开 Latest 仍为 v1.0.1。同步更新 README、部署说明、SEED 与本文件。 | `verify.ps1` 九组 MSVC 回归、七个生产 TU 编译检查通过；Zig 0.17.0 构建成功。`inspect_binary.py` 实际加载 query=1.1.1、零前置插件依赖，禁用写/对象创建能力扫描通过。DLL 1,478,656 字节，SHA256 `3A51BCA018B989CE0888C21072AC0CB5758597F08C0680F0CEFD37031951E820`。本次未运行独立 XLSX 校验或发布打包；未部署、重载、抓包或操作游戏。`AutoChessLevelEnemyManager` 本地缓存实际可读性、AllStateSync 完整度、名称映射和未来轮次覆盖仍待实机验证。 |
+| 2026-11-23 | 按后续产品决定移除逐轮出怪预览页及本地敌人缓存采集，`roundEnemies` 不再采集/展示；种子、隐藏 Boss ID 和可解析名称直接显示在主界面。完成商店记牌器：按玩家/轮次/刷新序号/货架槽位统计干员及其全部基础盟约频次，并展示观察到的获得、可匹配商店获得、推定卖出和持有实例数；修正 Hook 槽位边界以接受原始 P1–P4（避免漏记 P4），Session/轮次读取改为原子快照；更新 README、部署说明、AUDIT、SEED 与本文件。 | `verify.ps1` 十组 MSVC 测试（含 P1–P4 边界）和七个生产 TU 编译检查通过；独立工作簿七项回归与夹具内容检查通过。Zig 0.17.0 构建和 `inspect_binary.py` 实际 DLL query 1.1.1/零前置插件依赖/禁用写能力扫描通过。DLL 1,538,048 字节，SHA256 `5FCB7EDE167BEC670620A820F20A076DC5D2C91557C9C23A7EEC355AF33FA75D`。仅生成项目本地构建，未发布、打包或部署，未重载/操作游戏；AllStateSync/PreparationStatus Hook、队友状态覆盖、刷新频率、名称映射及获得/售出推定仍待实机验证。公开 Latest 仍为 v1.0.1。 |
+| 2026-11-23 | 修复 1.1.1 商店出现频率空表。原先本机快照已读取，但没有发布给记牌器。接通 `shopDataModel.chessGoods` 入队，按本机字符串 ID 和协议整数 ID 分别解析干员及基础盟约。修正不完整、重复和过期货架的处理，兼容可识别的零基名册，并分别绑定持有和获得条目的标识字段。补采集诊断与干员、盟约独立空状态，同步 README、部署说明、AUDIT 和 SEED。 | `verify.ps1` 十组 MSVC 测试与七个生产编译单元通过，含本机模拟货架到计数器的回归。七项独立工作簿测试与生成夹具检查通过。Zig 0.17.0 构建及实际 DLL query 1.1.1、零前置插件依赖、禁用写入和对象创建能力扫描通过。DLL 1,551,872 字节，SHA256 `174030938411E240FA4A761DC06A8932B7AB8639867F7B22225A99BD0A67E9AA`。产物留在项目 `dist`。当前客户端货架更新频率、实际干员和盟约映射、协议槽位与名册对应及队友覆盖仍待实机检查。 |
+| 2026-11-23 | 修复 1.1.1 记牌器干员和盟约名称。改从活动目录识别协议 `chessIdentifier`，用角色名称查询和盟约配置填充文本。名称独立于累计次数缓存，同一货架补到名称时更新已有行。缺名称时使用明确占位，内部键留在模型中。同步 README、部署说明、AUDIT 与 SEED。 | 十组 MSVC 测试及七个生产编译单元通过，含模拟活动配置解析协议干员和盟约名称、重复观察补名称与去重。Zig 0.17.0 构建、DLL 实际 query 1.1.1 和静态能力检查通过。七项 XLSX 校验器测试与生成夹具检查通过。本地 DLL 1,562,112 字节，SHA256 `BF0D937056BCA0E8B41AC531D59D89D7B3B4313318D5235204F6C1A0319B5B3D`。本局配置的实际解析覆盖和游戏内显示仍待实机验证。 |
+| 2026-11-23 | 修复 1.1.1 跨回合冻结商品重复计数。开局货架按同玩家上一相邻回合的冻结槽位去重，覆盖分批观察，同时修正干员和盟约频次。同步 README、部署说明、AUDIT 与 SEED。 | 新回归在旧逻辑下复现重复计数。修复后十组 MSVC 测试与七个生产编译单元通过，涵盖刷新序号有无、连续跨轮、分批货架和商品重新出现。独立 XLSX 校验器七项测试与生成夹具检查通过。Zig 0.17.0 构建和实际 DLL query 1.1.1、二进制能力扫描通过。本地 DLL 1,562,112 字节，SHA256 `E10782763C81BF78474A57DB129F38B777A135DDBB8F191358F85A3FAE171EA7`。修复版仍待局内复测换轮后两张频率表的读数。 |
+| 2026-11-23 | 修复 1.1.1 记牌器玩家范围。干员和盟约两张频率表按所选玩家的次数显示和排序，单玩家表只显示名称和出现次数。选「全体」时显示合计和各槽位次数。同步 README、部署说明、AUDIT 与 SEED。 | 回归在旧逻辑下复现取值和排序错误。十组 MSVC 回归和七个生产编译单元通过，含 P1/P4 模型测试和实际 ImGui 范围切换读数。独立 XLSX 校验器七项测试与生成夹具检查通过。Zig 0.17.0 构建与实际 DLL query 1.1.1、二进制能力扫描通过。项目内 DLL 1,562,112 字节，SHA256 `4AF8622C448CA82B34D3FDEAE2359CFD0AC1ACDA3E1A23868B81710592E4E470`。局内范围切换待实机复核。 |
+| 2026-11-23 | 修复 1.1.1 隐藏 Boss 名称。通过 `gameData.bossInfoDict` 和敌人图鉴解析显示名称，支持仅同步快照先读到 ID 的情况。主界面只显示名称或可用性状态，原始 ID 留作内部查找键。同步 README、部署说明、AUDIT 与 SEED。 | 从本地元数据和静态调用链核对 Boss 索引及敌人图鉴来源。十组 MSVC 回归和七个生产编译单元通过，含模拟 `boss_16`、图鉴别名回退和 UI 名称检查。七项独立工作簿测试及生成夹具校验通过。Zig 0.17.0 构建、DLL query 1.1.1 与能力扫描通过。项目内 DLL 1,566,208 字节，SHA256 `7D2F2B8747A5D9F3FEDB66F757851D07A700D99FE04F38A71BF415D1EE46E976`。当前客户端实际图鉴数据和局内 `boss_16` 名称仍待复测。 |
+| 2026-11-24 | 将当前源码版本从 1.1.1 提升为 1.2.0，纳入此前未发布的种子/Boss 主界面、商店记牌器及后续修复；同步 README、部署说明、SEED、AUDIT 与本文件。 | `verify.ps1` 十组 MSVC 回归和七个生产编译单元通过；独立 XLSX 校验器七项测试及生成工作簿夹具检查通过。Zig 0.17.0 构建成功，`inspect_binary.py` 实际加载 DLL query 版本 1.2.0、零前置插件依赖，禁用写入/对象创建能力扫描通过。项目内 DLL 1,566,208 字节，SHA256 `0442A4B0A609471A8E89C47879D280A3F0AB82AFEDEA669D892BC6C357C8136A`。未部署、重载、操作游戏或创建 GitHub Release；Boss 名称映射和记牌器联机覆盖等实机项目仍待复测。 |

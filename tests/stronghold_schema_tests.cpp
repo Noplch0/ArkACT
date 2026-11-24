@@ -193,6 +193,120 @@ struct CaptureTests {
         schema::read_report(root / "tests/fixtures/client-schema.txt");
         schema::read_report(root / "tests/fixtures/stronghold-status-schema.txt");
         schema::read_report(root / "tests/fixtures/stronghold-source-schema.txt");
+        // Explicit supplements for the optional AllStateSync observer. These
+        // classes are not present in the small public fixture subset, but the
+        // field types/names match the current client metadata report. Keeping
+        // them separate makes a missing hidden schema a safe optional path.
+        auto* allState = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattleAllStateSyncData");
+        auto* staticPlayer = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattlePlayerStaticInfo");
+        auto* sceneStatus = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattleSceneStatus");
+        auto* runtimePlayer = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattlePlayerRuntimeInfo");
+        auto* prepStatus = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattlePreparationStatus");
+        auto* store = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattleStoreInfo");
+        auto* storeGood = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattleStoreGoodInfo");
+        auto* analytics = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattlePreparationRoundAnalytics");
+        auto* chessCount = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattleChessCountInfo");
+        auto* ownedChess = schema::type("Torappu.UI.AutoChess.Server.AutoChessBattleCharChess");
+        auto* battleUtil = schema::type("Torappu.Battle.AutoChess.AutoChessBattleUtil");
+        auto* chessBasicInfo = schema::type("Torappu.Battle.AutoChess.ChessBasicInfo");
+        auto* itemType = schema::type("Torappu.AutoChessItemType");
+        auto* shopModel = schema::type("Torappu.Battle.AutoChess.AutoChessShopDataModel");
+        auto* shopGood = schema::type("Torappu.Battle.AutoChess.ChessGoods");
+        auto* shopGoodList = schema::type(
+            "System.Collections.Generic.List<Torappu.Battle.AutoChess.ChessGoods>");
+        auto* streamReader = schema::type("Torappu.DataStream.IStreamReader");
+        auto* stringType = schema::type("System.String");
+        auto* intType = schema::type("System.Int32");
+        auto* boolType = schema::type("System.Boolean");
+        auto* voidType = schema::type("System.Void");
+        auto* characterUtil = schema::type("Torappu.CharacterUtil");
+        auto* bondInfo = schema::type("Torappu.ActAutoChessData.ActAutoChessBondInfo");
+        bondInfo->fields.push_back({"name", stringType, 0x18});
+        characterUtil->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "GetCharName",
+            characterUtil, stringType, {stringType}, true});
+        allState->bytes = 0x60;
+        sceneStatus->bytes = 0;
+        staticPlayer->bytes = 0;
+        runtimePlayer->bytes = 0;
+        prepStatus->bytes = 0;
+        store->bytes = 0;
+        storeGood->bytes = 0;
+        streamReader->bytes = 0;
+        allState->fields = {
+            {"hiddenBossId", stringType, 0x28}, {"stageSeed", intType, 0x30},
+            {"staticPlayers", schema::type("System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattlePlayerStaticInfo>"), 0x40},
+            {"sceneDetail", sceneStatus, 0x48},
+        };
+        allState->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "Read", allState,
+            voidType, {streamReader}, false});
+        staticPlayer->fields = {
+            {"index", intType, 0x18},
+            {"bandId", stringType, 0x28},
+            {"bannedUnits", schema::type("System.Collections.Generic.List<Torappu.UI.AutoChess.Server.BannedUnit>"), 0x40},
+        };
+        sceneStatus->fields = {
+            {"state", schema::type("Torappu.AutoChessGameStateType"), 0x14},
+            {"round", intType, 0x18},
+            {"runtimePlayers", schema::type("System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattlePlayerRuntimeInfo>"), 0x28},
+            {"preparationStatus", schema::type("System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattlePreparationStatus>"), 0x40},
+        };
+        runtimePlayer->fields = {
+            {"uidIndex", intType, 0x10}, {"shopLv", intType, 0x1c},
+            {"hp", intType, 0x20}, {"state", schema::type("Torappu.AutoChessPlayerGameStateType"), 0x24},
+        };
+        analytics->fields = {
+            {"chessGained", schema::type(
+                "System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattleChessCountInfo>"), 0x10},
+        };
+        chessCount->fields = {
+            {"chessIdentifier", intType, 0x10}, {"count", intType, 0x14},
+        };
+        ownedChess->fields = {
+            {"instId", intType, 0x10}, {"chessIdentifier", intType, 0x20},
+        };
+        prepStatus->fields = {
+            {"uidIndex", intType, 0x10}, {"round", intType, 0x18}, {"store", store, 0x20},
+            {"charChess", schema::type(
+                "System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattleCharChess>"), 0x28},
+            {"roundAnalytics", analytics, 0x68},
+        };
+        prepStatus->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "Read", prepStatus,
+            voidType, {streamReader}, false});
+        store->fields = {
+            {"level", intType, 0x10}, {"coin", intType, 0x14}, {"upgradePrice", intType, 0x18},
+            {"refreshPrice", intType, 0x1c}, {"isSpecialGoods", schema::type("Torappu.AutoChessBattleShopGoodsType"), 0x20},
+            {"freeRefreshCnt", intType, 0x24}, {"specialRefresh", boolType, 0x28},
+            {"goods", schema::type(
+                "System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattleStoreGoodInfo>"), 0x30},
+            {"refreshSeq", intType, 0x38},
+        };
+        storeGood->fields = {
+            {"chessIdentifier", intType, 0x10}, {"slotId", intType, 0x14},
+            {"price", intType, 0x18}, {"isFrozen", boolType, 0x1c},
+        };
+        itemType->parent = schema::type("System.Enum");
+        itemType->bytes = 4;
+        itemType->fields.push_back({"CHAR", intType, 0x10, 1});
+        chessBasicInfo->bytes = 0x20; // Mock unboxed size for the declared fields.
+        chessBasicInfo->fields = {
+            {"charId", stringType, 0x10}, {"isGolden", boolType, 0x18},
+            {"itemType", itemType, 0x1c},
+            {"itemLevel", intType, 0x20},
+            {"basicBondIds", schema::type("System.Collections.Generic.List<System.String>"), 0x28},
+        };
+        battleUtil->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "GetChessBasicInfo",
+            battleUtil, chessBasicInfo, {stringType}, true});
+        battleUtil->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "GetChessBasicInfo",
+            battleUtil, chessBasicInfo, {intType}, true});
+        battleUtil->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "GetBondInfo",
+            battleUtil, bondInfo, {stringType}, true});
+        shopModel->fields = {{"chessGoods", shopGoodList, 0x38}, {"refreshSeq", intType, 0x40}};
+        shopGood->fields = {
+            {"chessId", stringType, 0x10}, {"slotId", intType, 0x18},
+            {"price", intType, 0x1c}, {"isFrozen", boolType, 0x20},
+        };
+        shopGoodList->methods.push_back({reinterpret_cast<void*>(&schema::native_stub), "get_Item",
+            shopGoodList, shopGood, {intType}, false});
         // The current report includes Entity and collection signatures. The
         // inherited closed generic singleton still needs this explicit
         // supplement, checked in the current client's metadata/native code.
@@ -349,7 +463,17 @@ struct CaptureTests {
         EXPECT(!capture.indexer_token_card_field_);
         EXPECT(capture.real_delta_offset_ == 0x48 && capture.shared_mask_offset_ == 0x3c);
         capture.bind_hooks(); // Host mock records hooks but never patches or executes code.
-        EXPECT(hook_count == 8);
+        EXPECT(hook_count == 10);
+        EXPECT(capture.shop_class_ == shopModel && capture.shop_goods_class_ == shopGood);
+        EXPECT(capture.shop_goods_field_ == &shopModel->fields[0] &&
+               capture.shop_refresh_seq_field_ == &shopModel->fields[1] &&
+               capture.shop_good_chess_id_field_ == &shopGood->fields[0]);
+        EXPECT(capture.chess_basic_info_by_id_method_ == &battleUtil->methods[0]);
+        EXPECT(capture.character_name_lookup_ == &characterUtil->methods[0]);
+        EXPECT(capture.bond_info_method_ == &battleUtil->methods[2] &&
+               capture.bond_info_name_field_ == &bondInfo->fields[0]);
+        EXPECT(capture.hidden_owned_identifier_field_ == &ownedChess->fields[1] &&
+               capture.hidden_chess_identifier_field_ == &chessCount->fields[0]);
         EXPECT(capture.manager_instance_info_ == &singleton->methods.front());
         EXPECT(capture.shutdown());
 
@@ -357,7 +481,7 @@ struct CaptureTests {
         for (auto& method : global->methods) if (method.name == "Update") method.name = "RemovedUpdate";
         bool hook_rejected = false;
         try { capture.bind_hooks(); } catch (const std::exception&) { hook_rejected = true; }
-        EXPECT(hook_rejected && hook_count == 8 && !capture.hook_schema_validated_);
+        EXPECT(hook_rejected && hook_count == 10 && !capture.hook_schema_validated_);
 
         // A field rename without the reference out ABI must be rejected.
         auto* lookup = static_cast<schema::Method*>(capture.runtime_card_lookup_info_);
@@ -365,7 +489,7 @@ struct CaptureTests {
         bool rejected = false;
         try { capture.bind_indexer(); } catch (const std::exception&) { rejected = true; }
         EXPECT(rejected);
-        std::printf("%s client schema plus explicit supplements: fields / getters / 8 hooks / inherited nullable singleton / reject wrong out ABI / reject missing hook\n", failures ? "FAIL" : "PASS");
+        std::printf("%s client schema plus explicit supplements: fields / getters / 10 hooks (8 core + optional sync and shop observers) / inherited nullable singleton / reject wrong out ABI / reject missing hook\n", failures ? "FAIL" : "PASS");
         return failures;
     }
 };

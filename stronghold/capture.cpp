@@ -23,6 +23,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ark/plugin.h>
@@ -40,6 +41,8 @@ constexpr std::uint32_t kModifierContinuous = 1;
 constexpr std::uint32_t kModifierEnvironment = 32;
 
 using LogModifierFn = void (*)(void*, void*, void*);
+using AllStateReadFn = void (*)(void*, void*, void*);
+using PreparationReadFn = void (*)(void*, void*, void*);
 using InstanceMethodFn = void (*)(void*, void*);
 using ReferenceGetter = void* (*)(void*, void*);
 using BoolGetter = bool (*)(void*, void*);
@@ -57,6 +60,16 @@ std::mutex g_error_mutex;
 std::string g_error;
 std::mutex g_diagnostics_mutex;
 std::string g_diagnostics = "Capture has not sampled the game thread yet.\n";
+std::mutex g_match_intel_mutex;
+MatchIntelSnapshot g_match_intel;
+std::mutex g_hidden_sync_mutex;
+HiddenSyncSnapshot g_hidden_sync;
+std::uint64_t g_hidden_sync_sequence = 0;
+std::mutex g_shop_observation_mutex;
+std::deque<ShopObservation> g_shop_observations;
+bool g_shop_observations_overrun = false;
+std::uint64_t g_shop_observation_session_id = 0;
+constexpr std::size_t kMaxShopObservations = 1024;
 std::mutex g_lifecycle_mutex;
 LogModifierFn original_log_modifier = nullptr;
 LogModifierFn original_log_ep_modifier = nullptr;
@@ -66,6 +79,8 @@ InstanceMethodFn original_on_destroy = nullptr;
 InstanceMethodFn original_update = nullptr;
 InstanceMethodFn original_global_update = nullptr;
 LogModifierFn original_applied_modifier = nullptr;
+AllStateReadFn original_all_state_read = nullptr;
+PreparationReadFn original_preparation_read = nullptr;
 
 void set_error(const std::string& error) {
     std::lock_guard lock(g_error_mutex);
@@ -94,6 +109,92 @@ void* read_object(void* object, void* field, il2cpp::Runtime& runtime) {
     return runtime.read_reference(object, field);
 }
 
+template <class T>
+T read_raw_value(void* object, std::size_t offset) noexcept {
+    T value{};
+    if (object) std::memcpy(&value, static_cast<unsigned char*>(object) + offset, sizeof(T));
+    return value;
+}
+
+void* read_raw_reference(void* object, std::size_t offset) noexcept {
+    return read_raw_value<void*>(object, offset);
+}
+
+std::size_t raw_field_offset(int (*field_offset)(void*), void* field) {
+    if (!field_offset || !field) throw std::runtime_error("Missing value-type field offset");
+    const int raw = field_offset(field);
+    if (raw < 2 * static_cast<int>(sizeof(void*)))
+        throw std::runtime_error("Value-type field offset lacks object header");
+    return static_cast<std::size_t>(raw - 2 * sizeof(void*));
+}
+
+constexpr std::size_t kMaxIntelItems = 32;
+
+void append_string_list(il2cpp::Runtime& runtime, void* sequence,
+                        std::vector<std::string>& output, std::size_t limit = kMaxIntelItems) {
+    if (!sequence) return;
+    const int count = runtime.count(sequence);
+    const int bounded = (std::min)(count, static_cast<int>(limit));
+    output.reserve(output.size() + static_cast<std::size_t>((std::max)(0, bounded)));
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            const std::string value = runtime.string(runtime.at(sequence, i));
+            if (!value.empty()) output.push_back(value);
+        } catch (...) {
+        }
+    }
+}
+
+void clear_match_intel() {
+    std::lock_guard lock(g_match_intel_mutex);
+    g_match_intel = MatchIntelSnapshot{};
+}
+
+void publish_match_intel(MatchIntelSnapshot snapshot) {
+    std::lock_guard lock(g_match_intel_mutex);
+    g_match_intel = std::move(snapshot);
+}
+
+void clear_hidden_sync() {
+    std::lock_guard lock(g_hidden_sync_mutex);
+    g_hidden_sync = HiddenSyncSnapshot{};
+    g_hidden_sync_sequence = 0;
+}
+
+void reset_hidden_sync_for_session(std::uint64_t session_id) {
+    std::lock_guard lock(g_hidden_sync_mutex);
+    g_hidden_sync = HiddenSyncSnapshot{};
+    g_hidden_sync.session_id = session_id;
+}
+
+void publish_hidden_sync(HiddenSyncSnapshot snapshot) {
+    std::lock_guard lock(g_hidden_sync_mutex);
+    snapshot.sequence = ++g_hidden_sync_sequence;
+    g_hidden_sync = std::move(snapshot);
+}
+
+void reset_shop_observations(std::uint64_t session_id) {
+    std::lock_guard lock(g_shop_observation_mutex);
+    g_shop_observations.clear();
+    g_shop_observations_overrun = false;
+    g_shop_observation_session_id = session_id;
+}
+
+void stop_shop_observations() {
+    std::lock_guard lock(g_shop_observation_mutex);
+    g_shop_observation_session_id = 0;
+}
+
+void publish_shop_observation(ShopObservation observation) {
+    std::lock_guard lock(g_shop_observation_mutex);
+    if (!observation.session_id || observation.session_id != g_shop_observation_session_id) return;
+    if (g_shop_observations.size() == kMaxShopObservations) {
+        g_shop_observations.pop_front();
+        g_shop_observations_overrun = true;
+    }
+    g_shop_observations.push_back(std::move(observation));
+}
+
 void* find_field_in_hierarchy(il2cpp::Runtime& runtime, void* klass, const char* name) {
     for (void* owner = klass; owner; owner = runtime.class_parent(owner)) {
         if (void* field = runtime.class_field(owner, name)) {
@@ -101,6 +202,22 @@ void* find_field_in_hierarchy(il2cpp::Runtime& runtime, void* klass, const char*
         }
     }
     return nullptr;
+}
+
+void* optional_field(il2cpp::Runtime& runtime, void* klass, const char* name) {
+    try {
+        return runtime.field(klass, name);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void* optional_method(il2cpp::Runtime& runtime, void* klass, const char* name, int count = 0) {
+    try {
+        return runtime.method(klass, name, count);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 std::string read_string_field(il2cpp::Runtime& runtime, void* object, void* klass,
@@ -211,6 +328,14 @@ struct PlayerInfo {
     int index = kUnknownPlayer;
     std::string uid;
     std::string name;
+    std::string band_id;
+    bool band_available = false;
+    std::vector<IntelSquadSlot> squad_slots;
+    bool squad_available = false;
+    int shop_level = 0;
+    bool shop_level_available = false;
+    int shop_coin = 0;
+    bool shop_coin_available = false;
     bool self = false;
     bool online = true;
     bool eliminated = false;
@@ -309,6 +434,26 @@ private:
     void bind_getters();
     void bind_timing();
     void bind_hooks();
+    bool bind_hidden_sync_schema();
+    bool bind_shop_counter_schema();
+    void bind_chess_descriptors();
+    bool install_hidden_sync_hook();
+    bool install_preparation_hook();
+    void capture_hidden_sync(void* all_state) noexcept;
+    void capture_shop_observation(void* preparation) noexcept;
+    int canonical_shop_player_slot(int raw_index) const noexcept;
+    ShopObservation read_shop_observation(void* preparation) const;
+    IntelChessRecord describe_chess(int identifier, int count) const;
+    IntelChessRecord describe_chess_info(void* boxed, int identifier, int count) const;
+    std::string resolve_operator_name(void* char_id, const std::string& id) const;
+    void refresh_shop_catalog(void* data_center);
+    IntelChessRecord shop_catalog_entry(int identifier, const std::string& chess_id = {}) const;
+    std::string resolve_boss_name(void* data_center, void* boss_id_object,
+                                  const std::string& boss_id) const;
+    std::vector<IntelChessRecord> read_hidden_chess_list(void* sequence) const;
+    std::vector<IntelChessRecord> read_hidden_gained_list(void* sequence) const;
+    IntelHiddenStore read_hidden_store(void* store) const;
+    std::vector<IntelShopGood> read_hidden_store_goods(void* sequence) const;
     bool shutdown_locked();
     void tick_runtime(bool force = false);
     void leave_mode();
@@ -351,9 +496,16 @@ private:
                       int& self_out, std::string& self_uid) const;
     bool read_player(void* player_model, int index, PlayerInfo& info, int& hp,
                      int& connect_state, bool& game_finished) const;
+    void refresh_match_intel(void* data_center, const std::vector<PlayerInfo>& players,
+                             int stage_seed);
+    std::vector<IntelBannedUnit> read_banned_units(void* sequence) const;
+    bool read_squad_slots(void* sequence, std::vector<IntelSquadSlot>& result) const;
+    std::vector<IntelShopGood> read_shop_goods(void* sequence, bool& slot_ids_available) const;
 
     static void on_log_modifier(void* self, void* modifier, void* method);
     static void on_log_ep_modifier(void* self, void* modifier, void* method);
+    static void on_all_state_read(void* self, void* reader, void* method);
+    static void on_preparation_read(void* self, void* reader, void* method);
     static void on_applied_modifier(void* self, void* modifier, void* method);
     static void on_start_game(void* self, void* method);
     static void on_clear_runtime_data(void* self, void* method);
@@ -378,6 +530,15 @@ private:
     void* battle_player_data_class_ = nullptr;
     void* battle_character_data_class_ = nullptr;
     void* auto_chess_center_class_ = nullptr;
+    void* hidden_all_state_class_ = nullptr;
+    void* hidden_static_player_class_ = nullptr;
+    void* hidden_scene_class_ = nullptr;
+    void* hidden_runtime_player_class_ = nullptr;
+    void* hidden_prep_class_ = nullptr;
+    void* hidden_store_class_ = nullptr;
+    void* hidden_store_good_class_ = nullptr;
+    void* hidden_analytics_class_ = nullptr;
+    void* hidden_chess_count_class_ = nullptr;
     void* auto_chess_settle_class_ = nullptr;
     void* player_data_model_class_ = nullptr;
     void* indexer_class_ = nullptr;
@@ -493,11 +654,114 @@ private:
     void* char_data_host_uid_field_ = nullptr;
 
     void* center_stage_seed_info_ = nullptr;
+    void* center_stage_id_info_ = nullptr;
+    void* center_mode_id_info_ = nullptr;
+    void* center_boss_id_info_ = nullptr;
+    void* center_hidden_boss_id_info_ = nullptr;
+    void* center_enemy_types_info_ = nullptr;
+    void* center_banned_bonds_info_ = nullptr;
+    void* center_self_banned_units_info_ = nullptr;
+    void* center_shop_model_field_ = nullptr;
     void* center_round_info_ = nullptr;
     void* center_self_info_ = nullptr;
     void* center_battle_players_info_ = nullptr;
     void* settle_ending_info_ = nullptr;
     void* player_model_get_player_info_ = nullptr;
+    void* scene_band_field_ = nullptr;
+    void* scene_squad_slots_field_ = nullptr;
+    void* scene_shop_level_field_ = nullptr;
+    void* scene_shop_coin_field_ = nullptr;
+    void* squad_slot_class_ = nullptr;
+    void* squad_char_id_field_ = nullptr;
+    void* squad_chess_id_field_ = nullptr;
+    void* squad_template_id_field_ = nullptr;
+    void* squad_cultivate_effect_id_field_ = nullptr;
+    void* squad_equip_id_field_ = nullptr;
+    void* squad_skin_id_field_ = nullptr;
+    void* squad_type_field_ = nullptr;
+    void* squad_potential_rank_field_ = nullptr;
+    void* squad_skill_index_field_ = nullptr;
+    void* squad_bond_ids_field_ = nullptr;
+    void* squad_banned_field_ = nullptr;
+    void* banned_unit_class_ = nullptr;
+    void* banned_unit_bond_id_field_ = nullptr;
+    void* banned_unit_chess_ids_field_ = nullptr;
+    void* shop_class_ = nullptr;
+    void* shop_level_field_ = nullptr;
+    void* shop_coin_field_ = nullptr;
+    void* shop_upgrade_field_ = nullptr;
+    void* shop_refresh_field_ = nullptr;
+    void* shop_goods_type_field_ = nullptr;
+    void* shop_free_refresh_field_ = nullptr;
+    void* shop_special_refresh_field_ = nullptr;
+    void* shop_goods_field_ = nullptr;
+    void* shop_refresh_seq_field_ = nullptr;
+    void* shop_goods_class_ = nullptr;
+    void* shop_good_chess_id_field_ = nullptr;
+    void* shop_good_slot_id_field_ = nullptr;
+    void* shop_good_price_field_ = nullptr;
+    void* shop_good_frozen_field_ = nullptr;
+
+    void* hidden_boss_id_field_ = nullptr;
+    void* hidden_stage_seed_field_ = nullptr;
+    void* hidden_static_players_field_ = nullptr;
+    void* hidden_scene_detail_field_ = nullptr;
+    void* hidden_static_index_field_ = nullptr;
+    void* hidden_static_band_field_ = nullptr;
+    void* hidden_static_banned_units_field_ = nullptr;
+    void* hidden_scene_state_field_ = nullptr;
+    void* hidden_scene_round_field_ = nullptr;
+    void* hidden_scene_runtime_players_field_ = nullptr;
+    void* hidden_scene_prep_status_field_ = nullptr;
+    void* hidden_runtime_uid_field_ = nullptr;
+    void* hidden_runtime_shop_lv_field_ = nullptr;
+    void* hidden_runtime_hp_field_ = nullptr;
+    void* hidden_runtime_state_field_ = nullptr;
+    void* hidden_prep_uid_field_ = nullptr;
+    void* hidden_prep_round_field_ = nullptr;
+    void* hidden_prep_store_field_ = nullptr;
+    void* hidden_prep_char_chess_field_ = nullptr;
+    void* hidden_prep_round_analytics_field_ = nullptr;
+    void* hidden_analytics_chess_gained_field_ = nullptr;
+    void* hidden_store_level_field_ = nullptr;
+    void* hidden_store_coin_field_ = nullptr;
+    void* hidden_store_upgrade_price_field_ = nullptr;
+    void* hidden_store_refresh_price_field_ = nullptr;
+    void* hidden_store_goods_type_field_ = nullptr;
+    void* hidden_store_free_refresh_field_ = nullptr;
+    void* hidden_store_special_refresh_field_ = nullptr;
+    void* hidden_store_goods_field_ = nullptr;
+    void* hidden_store_refresh_seq_field_ = nullptr;
+    void* hidden_good_identifier_field_ = nullptr;
+    void* hidden_good_slot_field_ = nullptr;
+    void* hidden_good_price_field_ = nullptr;
+    void* hidden_good_frozen_field_ = nullptr;
+    void* hidden_owned_identifier_field_ = nullptr;
+    void* hidden_chess_identifier_field_ = nullptr;
+    void* hidden_chess_count_field_ = nullptr;
+    void* battle_util_class_ = nullptr;
+    void* chess_basic_info_class_ = nullptr;
+    void* chess_basic_info_by_id_method_ = nullptr;
+    void* character_name_lookup_ = nullptr;
+    void* center_act_data_info_ = nullptr;
+    void* center_game_data_field_ = nullptr;
+    void* enemy_handbook_data_info_ = nullptr;
+    void* bond_info_method_ = nullptr;
+    void* bond_info_class_ = nullptr;
+    void* basic_info_char_id_field_ = nullptr;
+    void* basic_info_item_type_field_ = nullptr;
+    void* basic_info_bonds_field_ = nullptr;
+    void* bond_info_name_field_ = nullptr;
+    mutable std::mutex shop_catalog_mutex_;
+    std::map<int, IntelChessRecord> shop_catalog_;
+    std::map<std::string, int> shop_catalog_ids_;
+    std::uint64_t shop_catalog_next_sample_ = 0;
+    void* boss_info_class_ = nullptr;
+    int item_type_char_ = -1;
+    std::size_t hidden_boss_id_offset_ = 0;
+    std::size_t hidden_stage_seed_offset_ = 0;
+    std::size_t hidden_static_players_offset_ = 0;
+    std::size_t hidden_scene_detail_offset_ = 0;
 
     int (*field_offset_)(void*) = nullptr;
     std::size_t real_delta_offset_ = 0;
@@ -531,6 +795,13 @@ private:
     int host_cache_player_count_ = -1;
     bool explicit_partial_ = false;
     std::uint64_t session_id_ = 0;
+    std::atomic<std::uint64_t> shop_session_id_{0};
+    std::atomic<int> shop_round_{1};
+    std::atomic<int> shop_slot_mode_{0}; // 0: established 1-based, 1: observed zero-based
+    std::atomic<std::uint64_t> shop_observations_{0};
+    std::atomic<std::uint64_t> shop_local_observations_{0};
+    std::atomic<std::uint64_t> shop_hidden_observations_{0};
+    std::atomic<std::uint64_t> shop_rejected_observations_{0};
     std::uint64_t session_counter_ = 0;
     SessionTracker session_tracker_;
     std::uint32_t local_simulated_mask_ = 0;
@@ -614,6 +885,60 @@ void NativeCapture::bind_classes() {
     scene_player_data_class_ = runtime_.nested(player_data_model_class_, "ScenePlayerData");
     player_card_class_ = find_class_with_fallback(
         runtime_, "PlayerCard", {"Torappu.Battle.AutoChess", "Torappu.Battle.DataCenter"});
+    try {
+        squad_slot_class_ = find_class_with_fallback(
+            runtime_, "SquadSlot", {"Torappu.Battle.AutoChess"});
+    } catch (...) {
+        squad_slot_class_ = nullptr;
+    }
+    try {
+        banned_unit_class_ = find_class_with_fallback(
+            runtime_, "BannedUnit", {"Torappu.UI.AutoChess.Server"});
+    } catch (...) {
+        banned_unit_class_ = nullptr;
+    }
+    try {
+        hidden_all_state_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattleAllStateSyncData", {"Torappu.UI.AutoChess.Server"});
+        hidden_static_player_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattlePlayerStaticInfo", {"Torappu.UI.AutoChess.Server"});
+        hidden_scene_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattleSceneStatus", {"Torappu.UI.AutoChess.Server"});
+        hidden_runtime_player_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattlePlayerRuntimeInfo", {"Torappu.UI.AutoChess.Server"});
+    } catch (...) {
+        hidden_all_state_class_ = nullptr;
+        hidden_static_player_class_ = nullptr;
+        hidden_scene_class_ = nullptr;
+        hidden_runtime_player_class_ = nullptr;
+    }
+    try {
+        hidden_prep_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattlePreparationStatus", {"Torappu.UI.AutoChess.Server"});
+        hidden_store_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattleStoreInfo", {"Torappu.UI.AutoChess.Server"});
+        hidden_store_good_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattleStoreGoodInfo", {"Torappu.UI.AutoChess.Server"});
+        hidden_analytics_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattlePreparationRoundAnalytics", {"Torappu.UI.AutoChess.Server"});
+        hidden_chess_count_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattleChessCountInfo", {"Torappu.UI.AutoChess.Server"});
+    } catch (...) {
+        hidden_prep_class_ = nullptr;
+        hidden_store_class_ = nullptr;
+        hidden_store_good_class_ = nullptr;
+        hidden_analytics_class_ = nullptr;
+        hidden_chess_count_class_ = nullptr;
+    }
+    try {
+        battle_util_class_ = find_class_with_fallback(
+            runtime_, "AutoChessBattleUtil", {"Torappu.Battle.AutoChess"});
+        chess_basic_info_class_ = find_class_with_fallback(
+            runtime_, "ChessBasicInfo", {"Torappu.Battle.AutoChess"});
+    } catch (...) {
+        battle_util_class_ = nullptr;
+        chess_basic_info_class_ = nullptr;
+    }
     fixed_point_class_ = runtime_.find("Torappu", "FP");
     manager_class_ = find_class_with_fallback(runtime_, "AutoChessGameManager", {"Torappu.Battle.AutoChess"});
     if (host_.log) {
@@ -645,6 +970,32 @@ void NativeCapture::bind_fields() {
     } catch (...) {
         data_center_settle_field_ = nullptr;
     }
+    center_shop_model_field_ = optional_field(runtime_, auto_chess_center_class_, "shopDataModel");
+    if (center_shop_model_field_) {
+        try {
+            shop_class_ = runtime_.class_from_type(runtime_.field_type(center_shop_model_field_));
+            if (shop_class_ && runtime_.class_is_value(shop_class_)) shop_class_ = nullptr;
+        } catch (...) {}
+    }
+    center_stage_id_info_ = optional_method(runtime_, auto_chess_center_class_, "get_stageId");
+    center_mode_id_info_ = optional_method(runtime_, auto_chess_center_class_, "get_modeId");
+    center_boss_id_info_ = optional_method(runtime_, auto_chess_center_class_, "get_bossId");
+    center_hidden_boss_id_info_ =
+        optional_method(runtime_, auto_chess_center_class_, "get_hiddenBossId");
+    center_act_data_info_ = optional_method(runtime_, auto_chess_center_class_, "get_actData");
+    center_game_data_field_ = optional_field(runtime_, auto_chess_center_class_, "gameData");
+    try {
+        void* handbook = runtime_.find("Torappu", "EnemyHandBookDB");
+        void* getter = runtime_.method(handbook, "get_data", 0);
+        std::uint32_t impl = 0;
+        if ((runtime_.method_flags(getter, &impl) & 0x10u) &&
+            runtime_.type(runtime_.method_return(getter)) == "Torappu.EnemyHandBookDataGroup")
+            enemy_handbook_data_info_ = getter;
+    } catch (...) {}
+    center_enemy_types_info_ = optional_method(runtime_, auto_chess_center_class_, "get_enemyTypes");
+    center_banned_bonds_info_ = optional_method(runtime_, auto_chess_center_class_, "get_bannedBonds");
+    center_self_banned_units_info_ = optional_method(
+        runtime_, auto_chess_center_class_, "get_selfBannedUnits");
     card_nickname_field_ = runtime_.field(player_card_class_, "nickName");
     scene_index_field_ = runtime_.field(scene_player_data_class_, "index");
     scene_uid_field_ = runtime_.field(scene_player_data_class_, "uid");
@@ -652,6 +1003,76 @@ void NativeCapture::bind_fields() {
     scene_hp_field_ = runtime_.field(scene_player_data_class_, "hp");
     scene_finished_field_ = runtime_.field(scene_player_data_class_, "gameFinished");
     scene_connect_field_ = runtime_.field(scene_player_data_class_, "connectState");
+    scene_band_field_ = optional_field(runtime_, scene_player_data_class_, "bandId");
+    scene_squad_slots_field_ = optional_field(runtime_, scene_player_data_class_, "squadSlots");
+    scene_shop_level_field_ = optional_field(runtime_, scene_player_data_class_, "shopLevel");
+    scene_shop_coin_field_ = optional_field(runtime_, scene_player_data_class_, "shopCoin");
+    if (squad_slot_class_) {
+        squad_char_id_field_ = optional_field(runtime_, squad_slot_class_, "charId");
+        squad_chess_id_field_ = optional_field(runtime_, squad_slot_class_, "chessId");
+        squad_template_id_field_ = optional_field(runtime_, squad_slot_class_, "tmplId");
+        squad_cultivate_effect_id_field_ =
+            optional_field(runtime_, squad_slot_class_, "cultivateEffectId");
+        squad_equip_id_field_ = optional_field(runtime_, squad_slot_class_, "currentEquip");
+        squad_skin_id_field_ = optional_field(runtime_, squad_slot_class_, "skinId");
+        squad_type_field_ = optional_field(runtime_, squad_slot_class_, "type");
+        squad_potential_rank_field_ = optional_field(runtime_, squad_slot_class_, "potentialRank");
+        squad_skill_index_field_ = optional_field(runtime_, squad_slot_class_, "skillIndex");
+        squad_bond_ids_field_ = optional_field(runtime_, squad_slot_class_, "bondList");
+        squad_banned_field_ = optional_field(runtime_, squad_slot_class_, "isBanned");
+    }
+    if (banned_unit_class_) {
+        banned_unit_bond_id_field_ = optional_field(runtime_, banned_unit_class_, "bondId");
+        banned_unit_chess_ids_field_ = optional_field(runtime_, banned_unit_class_, "chessIdentifier");
+    }
+    if (shop_class_) {
+        shop_level_field_ = optional_field(runtime_, shop_class_, "level");
+        shop_coin_field_ = optional_field(runtime_, shop_class_, "currentCoin");
+        shop_upgrade_field_ = optional_field(runtime_, shop_class_, "upgradePrice");
+        shop_refresh_field_ = optional_field(runtime_, shop_class_, "refreshPrice");
+        shop_goods_type_field_ = optional_field(runtime_, shop_class_, "goodsType");
+        shop_free_refresh_field_ = optional_field(runtime_, shop_class_, "freeRefreshCnt");
+        shop_special_refresh_field_ = optional_field(runtime_, shop_class_, "specialRefresh");
+        shop_goods_field_ = optional_field(runtime_, shop_class_, "chessGoods");
+        shop_refresh_seq_field_ = optional_field(runtime_, shop_class_, "refreshSeq");
+        if (shop_refresh_seq_field_ &&
+            runtime_.type(runtime_.field_type(shop_refresh_seq_field_)) != "System.Int32")
+            shop_refresh_seq_field_ = nullptr;
+        if (shop_goods_field_) {
+            try {
+                void* list_class = runtime_.class_from_type(runtime_.field_type(shop_goods_field_));
+                void* indexer = runtime_.method(list_class, "get_Item", 1, {"System.Int32"});
+                shop_goods_class_ = runtime_.class_from_type(runtime_.method_return(indexer));
+                if (shop_goods_class_ && runtime_.type(runtime_.class_type(shop_goods_class_)) !=
+                        "Torappu.Battle.AutoChess.ChessGoods")
+                    shop_goods_class_ = nullptr;
+            } catch (...) {}
+            if (!shop_goods_class_ &&
+                runtime_.type(runtime_.field_type(shop_goods_field_)) ==
+                    "System.Collections.Generic.List<Torappu.Battle.AutoChess.ChessGoods>") {
+                try { shop_goods_class_ = runtime_.find("Torappu.Battle.AutoChess", "ChessGoods"); }
+                catch (...) {}
+            }
+        }
+    }
+    if (shop_goods_class_) {
+        shop_good_chess_id_field_ = optional_field(runtime_, shop_goods_class_, "chessId");
+        shop_good_slot_id_field_ = optional_field(runtime_, shop_goods_class_, "slotId");
+        shop_good_price_field_ = optional_field(runtime_, shop_goods_class_, "price");
+        shop_good_frozen_field_ = optional_field(runtime_, shop_goods_class_, "isFrozen");
+        if (shop_good_chess_id_field_ &&
+            runtime_.type(runtime_.field_type(shop_good_chess_id_field_)) != "System.String")
+            shop_good_chess_id_field_ = nullptr;
+        if (shop_good_slot_id_field_ &&
+            runtime_.type(runtime_.field_type(shop_good_slot_id_field_)) != "System.Int32")
+            shop_good_slot_id_field_ = nullptr;
+        if (shop_good_price_field_ &&
+            runtime_.type(runtime_.field_type(shop_good_price_field_)) != "System.Int32")
+            shop_good_price_field_ = nullptr;
+        if (shop_good_frozen_field_ &&
+            runtime_.type(runtime_.field_type(shop_good_frozen_field_)) != "System.Boolean")
+            shop_good_frozen_field_ = nullptr;
+    }
     scene_dead_info_ = runtime_.method(scene_player_data_class_, "get_isDead", 0);
     void* connect_class = runtime_.class_from_type(runtime_.field_type(scene_connect_field_));
     connect_online_ = runtime_.enum_value(connect_class, "ONLINE");
@@ -842,6 +1263,7 @@ void NativeCapture::bind_getters() {
 
 void NativeCapture::bind_hooks() {
     hook_schema_validated_ = false;
+    bind_hidden_sync_schema();
     struct PendingHook { void* target; void* detour; void** original; const char* name; };
     std::vector<PendingHook> pending;
     const auto hook = [&](void* klass, const char* name, int params, auto detour,
@@ -877,10 +1299,23 @@ void NativeCapture::bind_hooks() {
     hook(runtime_.find("Torappu", "GlobalInitializerAndUpdater"), "Update", 0,
          NativeCapture::on_global_update, original_global_update);
 
+    bind_chess_descriptors();
+    const bool shop_protocol_schema = bind_shop_counter_schema();
+
     // Resolve every signature before creating the first hook. Metadata failures
     // stay distinguishable from a temporarily unavailable host hook service.
     hook_schema_validated_ = true;
     hook_diagnostics_.clear();
+    hook_diagnostics_.push_back(center_game_data_field_ && enemy_handbook_data_info_
+        ? "bossName bound" : "bossName unavailable: schema");
+    hook_diagnostics_.push_back(shop_goods_field_ && shop_good_chess_id_field_
+        ? "localShopShelf bound" : "localShopShelf unavailable: schema");
+    hook_diagnostics_.push_back(chess_basic_info_by_id_method_
+        ? "localShopDescriptors bound" : "localShopDescriptors unavailable: schema");
+    hook_diagnostics_.push_back(character_name_lookup_
+        ? "shopOperatorName bound" : "shopOperatorName unavailable: schema");
+    hook_diagnostics_.push_back(bond_info_method_
+        ? "shopBondName bound" : "shopBondName unavailable: schema");
     for (const auto& item : pending) {
         std::ostringstream description;
         description << item.name << " RVA=0x" << std::hex <<
@@ -903,6 +1338,885 @@ void NativeCapture::bind_hooks() {
             throw std::runtime_error("Could not enable IL2CPP hook");
         }
     }
+    install_hidden_sync_hook();
+    if (shop_protocol_schema) install_preparation_hook();
+    else hook_diagnostics_.push_back("preparationStatusRead unavailable: schema");
+}
+
+bool NativeCapture::bind_hidden_sync_schema() {
+    if (!hidden_all_state_class_ || !hidden_static_player_class_ || !hidden_scene_class_ ||
+        !hidden_runtime_player_class_) {
+        return false;
+    }
+    if (!field_offset_ || !runtime_.class_is_value(hidden_all_state_class_)) return false;
+
+    hidden_boss_id_field_ = optional_field(runtime_, hidden_all_state_class_, "hiddenBossId");
+    hidden_stage_seed_field_ = optional_field(runtime_, hidden_all_state_class_, "stageSeed");
+    hidden_static_players_field_ =
+        optional_field(runtime_, hidden_all_state_class_, "staticPlayers");
+    hidden_scene_detail_field_ =
+        optional_field(runtime_, hidden_all_state_class_, "sceneDetail");
+    if (!hidden_boss_id_field_ || !hidden_stage_seed_field_ || !hidden_static_players_field_ ||
+        !hidden_scene_detail_field_) {
+        return false;
+    }
+
+    hidden_static_index_field_ =
+        optional_field(runtime_, hidden_static_player_class_, "index");
+    hidden_static_band_field_ =
+        optional_field(runtime_, hidden_static_player_class_, "bandId");
+    hidden_static_banned_units_field_ =
+        optional_field(runtime_, hidden_static_player_class_, "bannedUnits");
+    hidden_scene_state_field_ = optional_field(runtime_, hidden_scene_class_, "state");
+    hidden_scene_round_field_ = optional_field(runtime_, hidden_scene_class_, "round");
+    hidden_scene_runtime_players_field_ =
+        optional_field(runtime_, hidden_scene_class_, "runtimePlayers");
+    hidden_scene_prep_status_field_ =
+        optional_field(runtime_, hidden_scene_class_, "preparationStatus");
+    hidden_runtime_uid_field_ =
+        optional_field(runtime_, hidden_runtime_player_class_, "uidIndex");
+    hidden_runtime_shop_lv_field_ =
+        optional_field(runtime_, hidden_runtime_player_class_, "shopLv");
+    hidden_runtime_hp_field_ = optional_field(runtime_, hidden_runtime_player_class_, "hp");
+    hidden_runtime_state_field_ = optional_field(runtime_, hidden_runtime_player_class_, "state");
+
+    try {
+        hidden_boss_id_offset_ = raw_field_offset(field_offset_, hidden_boss_id_field_);
+        hidden_stage_seed_offset_ = raw_field_offset(field_offset_, hidden_stage_seed_field_);
+        hidden_static_players_offset_ =
+            raw_field_offset(field_offset_, hidden_static_players_field_);
+        hidden_scene_detail_offset_ = raw_field_offset(field_offset_, hidden_scene_detail_field_);
+        std::uint32_t alignment = 0;
+        const int size = runtime_.class_value_size(hidden_all_state_class_, &alignment);
+        if (hidden_boss_id_offset_ + sizeof(void*) > static_cast<std::size_t>(size) ||
+            hidden_stage_seed_offset_ + sizeof(int) > static_cast<std::size_t>(size) ||
+            hidden_static_players_offset_ + sizeof(void*) > static_cast<std::size_t>(size) ||
+            hidden_scene_detail_offset_ + sizeof(void*) > static_cast<std::size_t>(size)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+bool NativeCapture::bind_shop_counter_schema() {
+    if (!hidden_prep_class_ || !hidden_store_class_ || !hidden_store_good_class_) return false;
+    try {
+        hidden_prep_uid_field_ = runtime_.field(hidden_prep_class_, "uidIndex");
+        hidden_prep_round_field_ = runtime_.field(hidden_prep_class_, "round");
+        hidden_prep_store_field_ = runtime_.field(hidden_prep_class_, "store");
+        hidden_prep_char_chess_field_ = optional_field(runtime_, hidden_prep_class_, "charChess");
+        hidden_prep_round_analytics_field_ = optional_field(runtime_, hidden_prep_class_, "roundAnalytics");
+        hidden_store_goods_field_ = runtime_.field(hidden_store_class_, "goods");
+        hidden_store_level_field_ = optional_field(runtime_, hidden_store_class_, "level");
+        hidden_store_coin_field_ = optional_field(runtime_, hidden_store_class_, "coin");
+        hidden_store_upgrade_price_field_ = optional_field(runtime_, hidden_store_class_, "upgradePrice");
+        hidden_store_refresh_price_field_ = optional_field(runtime_, hidden_store_class_, "refreshPrice");
+        hidden_store_goods_type_field_ = optional_field(runtime_, hidden_store_class_, "isSpecialGoods");
+        hidden_store_free_refresh_field_ = optional_field(runtime_, hidden_store_class_, "freeRefreshCnt");
+        hidden_store_special_refresh_field_ = optional_field(runtime_, hidden_store_class_, "specialRefresh");
+        hidden_store_refresh_seq_field_ = optional_field(runtime_, hidden_store_class_, "refreshSeq");
+        hidden_good_identifier_field_ = runtime_.field(hidden_store_good_class_, "chessIdentifier");
+        hidden_good_slot_field_ = runtime_.field(hidden_store_good_class_, "slotId");
+        hidden_good_price_field_ = optional_field(runtime_, hidden_store_good_class_, "price");
+        hidden_good_frozen_field_ = optional_field(runtime_, hidden_store_good_class_, "isFrozen");
+        hidden_chess_identifier_field_ = optional_field(runtime_, hidden_chess_count_class_, "chessIdentifier");
+        hidden_chess_count_field_ = optional_field(runtime_, hidden_chess_count_class_, "count");
+        hidden_analytics_chess_gained_field_ = optional_field(runtime_, hidden_analytics_class_, "chessGained");
+        if (hidden_prep_char_chess_field_) {
+            try {
+                void* owned_class = runtime_.find(
+                    "Torappu.UI.AutoChess.Server", "AutoChessBattleCharChess");
+                if (runtime_.type(runtime_.field_type(hidden_prep_char_chess_field_)) ==
+                    "System.Collections.Generic.List<Torappu.UI.AutoChess.Server.AutoChessBattleCharChess>")
+                    hidden_owned_identifier_field_ = optional_field(runtime_, owned_class, "chessIdentifier");
+                if (hidden_owned_identifier_field_ &&
+                    runtime_.type(runtime_.field_type(hidden_owned_identifier_field_)) != "System.Int32")
+                    hidden_owned_identifier_field_ = nullptr;
+            } catch (...) {}
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string NativeCapture::resolve_operator_name(void* char_id, const std::string& id) const {
+    if (!character_name_lookup_ || !char_id || id.empty()) return {};
+    try {
+        auto name = runtime_.string(runtime_.invoke(character_name_lookup_, nullptr, {char_id}));
+        if (name != id) return name;
+    } catch (...) {}
+    return {};
+}
+
+IntelChessRecord NativeCapture::shop_catalog_entry(int identifier, const std::string& chess_id) const {
+    std::lock_guard lock(shop_catalog_mutex_);
+    if (!chess_id.empty()) {
+        const auto it = shop_catalog_ids_.find(chess_id);
+        if (it == shop_catalog_ids_.end()) return {};
+        identifier = it->second;
+    }
+    const auto entry = shop_catalog_.find(identifier);
+    if (entry != shop_catalog_.end()) return entry->second;
+    IntelChessRecord unresolved;
+    unresolved.chess_identifier = identifier;
+    return unresolved;
+}
+
+void NativeCapture::refresh_shop_catalog(void* data_center) {
+    if (!data_center || !center_act_data_info_ || GetTickCount64() < shop_catalog_next_sample_) return;
+    shop_catalog_next_sample_ = GetTickCount64() + 1000;
+    try {
+        if (runtime_.type(runtime_.method_return(center_act_data_info_)) != "Torappu.ActAutoChessData")
+            return;
+        il2cpp::Runtime::Root act(runtime_, runtime_.invoke(center_act_data_info_, data_center));
+        if (!act.get()) return;
+        void* act_class = runtime_.object_class(act.get());
+        const auto field = [&](void* owner, const char* name, const std::string& type) -> void* {
+            void* result = optional_field(runtime_, owner, name);
+            return result && runtime_.type(runtime_.field_type(result)) == type ? result : nullptr;
+        };
+        const auto table = [&](const char* name, const char* value_type) -> void* {
+            const auto type = std::string("Torappu.ListDict<System.String,") + value_type + ">";
+            return read_object(act.get(), field(act_class, name, type), runtime_);
+        };
+        constexpr auto chars = "Torappu.ActAutoChessData.ActAutoChessCharChessData";
+        constexpr auto shop_chars = "Torappu.ActAutoChessData.ActAutoChessCharShopChessData";
+        constexpr auto bonds = "Torappu.ActAutoChessData.ActAutoChessBondInfo";
+        constexpr auto traps = "Torappu.ActAutoChessData.ActAutoChessTrapChessData";
+        il2cpp::Runtime::Root shop_table(runtime_, table("charShopChessDatas", shop_chars));
+        il2cpp::Runtime::Root bond_table(runtime_, table("bondInfoDict", bonds));
+
+        const auto lookup = [&](void* dictionary, const char* type) -> void* {
+            if (!dictionary) return nullptr;
+            void* result = runtime_.method(runtime_.object_class(dictionary), "TryGetValue", 2,
+                                           {"System.String", std::string(type) + "&"});
+            std::uint32_t impl = 0;
+            return !(runtime_.method_flags(result, &impl) & 0x10u) &&
+                    runtime_.type(runtime_.method_return(result)) == "System.Boolean" ? result : nullptr;
+        };
+        void* shop_lookup = nullptr;
+        void* bond_lookup = nullptr;
+        try { shop_lookup = lookup(shop_table.get(), shop_chars); } catch (...) {}
+        try { bond_lookup = lookup(bond_table.get(), bonds); } catch (...) {}
+        const auto find = [&](void* method, void* dictionary, void* id) -> void* {
+            void* value = nullptr;
+            if (method && runtime_.unbox<bool>(runtime_.invoke(method, dictionary, {id, &value})))
+                return value;
+            return nullptr;
+        };
+        const auto string_field = [&](void* object, const char* name) -> void* {
+            return object ? read_object(object, field(runtime_.object_class(object), name, "System.String"),
+                                        runtime_) : nullptr;
+        };
+
+        std::map<int, IntelChessRecord> entries;
+        std::map<std::string, int> by_id;
+        const auto read_table = [&](const char* table_name, const char* row_type, bool is_character) {
+            il2cpp::Runtime::Root rows(runtime_, table(table_name, row_type));
+            if (!rows.get()) return;
+            // ListDict.Get(Int32) reads its existing KeyValuePair list by position.
+            void* get = runtime_.method(runtime_.object_class(rows.get()), "Get", 1, {"System.Int32"});
+            void* pair_type = runtime_.method_return(get);
+            const auto expected_pair = std::string("System.Collections.Generic.KeyValuePair<System.String,") +
+                                       row_type + ">";
+            std::uint32_t impl = 0;
+            if ((runtime_.method_flags(get, &impl) & 0x10u) || runtime_.type(pair_type) != expected_pair)
+                return;
+            void* value_field = field(runtime_.class_from_type(pair_type), "value", row_type);
+            if (!value_field) return;
+            void* row_class = runtime_.class_from_type(runtime_.field_type(value_field));
+            void* identifier_field = field(row_class, "identifier", "System.Int32");
+            void* id_field = field(row_class, "chessId", "System.String");
+            if (!identifier_field || !id_field) return;
+            void* bond_ids_field = is_character ? field(row_class, "bondIds",
+                "System.Collections.Generic.List<System.String>") : nullptr;
+            const int count = runtime_.count(rows.get());
+            if (count <= 0 || count > 4096) return;
+            for (int i = 0; i < count; ++i) {
+                try {
+                    il2cpp::Runtime::Root pair(runtime_, runtime_.invoke(get, rows.get(), {&i}));
+                    il2cpp::Runtime::Root row(runtime_, read_object(pair.get(), value_field, runtime_));
+                    if (!row.get()) continue;
+                    const int identifier = read_value<int>(row.get(), identifier_field, runtime_);
+                    void* chess_id_object = read_object(row.get(), id_field, runtime_);
+                    const auto chess_id = runtime_.string(chess_id_object);
+                    if (identifier < 0 || chess_id.empty()) continue;
+                    IntelChessRecord descriptor;
+                    descriptor.chess_identifier = identifier;
+                    descriptor.chess_id = chess_id;
+                    descriptor.operator_available = is_character;
+                    if (is_character) {
+                        try {
+                            if (void* shop_row = find(shop_lookup, shop_table.get(), chess_id_object)) {
+                                void* char_id_object = string_field(shop_row, "charId");
+                                auto char_id = runtime_.string(char_id_object);
+                                if (!char_id.empty()) {
+                                    descriptor.chess_id = std::move(char_id);
+                                    descriptor.operator_name = resolve_operator_name(char_id_object, descriptor.chess_id);
+                                }
+                            }
+                        } catch (...) {}
+                        if (descriptor.operator_name.empty())
+                            descriptor.operator_name = resolve_operator_name(chess_id_object, chess_id);
+                    }
+                    void* bond_ids = read_object(row.get(), bond_ids_field, runtime_);
+                    if (bond_ids) {
+                        const int bond_count = (std::min)(runtime_.count(bond_ids), static_cast<int>(kMaxIntelItems));
+                        for (int index = 0; index < bond_count; ++index) {
+                            void* bond_id = runtime_.at(bond_ids, index);
+                            auto id = runtime_.string(bond_id);
+                            if (id.empty()) continue;
+                            std::string name;
+                            try {
+                                name = runtime_.string(string_field(
+                                    find(bond_lookup, bond_table.get(), bond_id), "name"));
+                            } catch (...) {}
+                            descriptor.bond_ids.push_back(std::move(id));
+                            descriptor.bond_names.push_back(std::move(name));
+                        }
+                    }
+                    if (entries.try_emplace(identifier, std::move(descriptor)).second)
+                        by_id.try_emplace(chess_id, identifier);
+                } catch (...) {}
+            }
+        };
+        read_table("charChessDataDict", chars, true);
+        if (!entries.empty()) {
+            try { read_table("trapChessDataDict", traps, false); } catch (...) {}
+            std::lock_guard lock(shop_catalog_mutex_);
+            shop_catalog_ = std::move(entries);
+            shop_catalog_ids_ = std::move(by_id);
+            shop_catalog_next_sample_ = UINT64_MAX;
+        }
+    } catch (...) {}
+}
+
+void NativeCapture::bind_chess_descriptors() {
+    try {
+        void* util = runtime_.find("Torappu", "CharacterUtil");
+        void* method = runtime_.method(util, "GetCharName", 1, {"System.String"});
+        std::uint32_t impl = 0;
+        if ((runtime_.method_flags(method, &impl) & 0x10u) &&
+            runtime_.type(runtime_.method_return(method)) == "System.String")
+            character_name_lookup_ = method;
+    } catch (...) {}
+    if (!battle_util_class_ || !chess_basic_info_class_) return;
+    try {
+        void* method = runtime_.method(battle_util_class_, "GetBondInfo", 1, {"System.String"});
+        std::uint32_t impl = 0;
+        void* result_type = runtime_.method_return(method);
+        if ((runtime_.method_flags(method, &impl) & 0x10u) &&
+            runtime_.type(result_type) == "Torappu.ActAutoChessData.ActAutoChessBondInfo") {
+            bond_info_class_ = runtime_.class_from_type(result_type);
+            bond_info_name_field_ = runtime_.field(bond_info_class_, "name");
+            if (!runtime_.class_is_value(bond_info_class_) &&
+                runtime_.type(runtime_.field_type(bond_info_name_field_)) == "System.String")
+                bond_info_method_ = method;
+        }
+    } catch (...) {}
+    try {
+        basic_info_char_id_field_ = runtime_.field(chess_basic_info_class_, "charId");
+        basic_info_item_type_field_ = runtime_.field(chess_basic_info_class_, "itemType");
+        basic_info_bonds_field_ = runtime_.field(chess_basic_info_class_, "basicBondIds");
+        if (!runtime_.class_is_value(chess_basic_info_class_) ||
+            runtime_.type(runtime_.field_type(basic_info_char_id_field_)) != "System.String" ||
+            runtime_.type(runtime_.field_type(basic_info_bonds_field_)) !=
+                "System.Collections.Generic.List<System.String>") return;
+        void* item_type_class = runtime_.class_from_type(runtime_.field_type(basic_info_item_type_field_));
+        item_type_char_ = runtime_.enum_value(item_type_class, "CHAR");
+        std::uint32_t impl = 0;
+        const auto basic_lookup = [&](const char* parameter) -> void* {
+            try {
+                void* method = runtime_.method(battle_util_class_, "GetChessBasicInfo", 1, {parameter});
+                if ((runtime_.method_flags(method, &impl) & 0x10u) &&
+                    runtime_.type(runtime_.method_return(method)) ==
+                        runtime_.type(runtime_.class_type(chess_basic_info_class_)))
+                    return method;
+            } catch (...) {}
+            return nullptr;
+        };
+        chess_basic_info_by_id_method_ = basic_lookup("System.String");
+    } catch (...) {
+    }
+}
+
+bool NativeCapture::install_hidden_sync_hook() {
+    if (!hidden_all_state_class_ || !bind_hidden_sync_schema()) {
+        hook_diagnostics_.push_back("hiddenAllStateRead unavailable: schema");
+        return false;
+    }
+    try {
+        void* method = runtime_.method(hidden_all_state_class_, "Read", 1,
+                                       {"Torappu.DataStream.IStreamReader"});
+        std::uint32_t implementation = 0;
+        if ((runtime_.method_flags(method, &implementation) & 0x10u) ||
+            runtime_.type(runtime_.method_return(method)) != "System.Void" ||
+            runtime_.type(runtime_.method_param(method, 0)) != "Torappu.DataStream.IStreamReader") {
+            hook_diagnostics_.push_back("hiddenAllStateRead unavailable: ABI");
+            return false;
+        }
+        void* target = entry_point(method);
+        if (!il2cpp::is_executable(target)) {
+            hook_diagnostics_.push_back("hiddenAllStateRead unavailable: target");
+            return false;
+        }
+        const std::uint64_t id = host_.create_native_hook(
+            host_.owner, target, reinterpret_cast<void*>(NativeCapture::on_all_state_read),
+            reinterpret_cast<void**>(&original_all_state_read));
+        if (!id) return false;
+        hooks_.push_back(id);
+        if (!host_.enable_native_hook(host_.owner, id, true)) {
+            if (host_.remove_native_hook(host_.owner, id)) hooks_.pop_back();
+            original_all_state_read = nullptr;
+            hook_diagnostics_.push_back("hiddenAllStateRead unavailable: host hook");
+            return false;
+        }
+        std::ostringstream description;
+        description << "hiddenAllStateRead RVA=0x" << std::hex
+                    << (reinterpret_cast<std::uintptr_t>(target) -
+                        reinterpret_cast<std::uintptr_t>(il2cpp::game_assembly()));
+        hook_diagnostics_.push_back(description.str());
+        return true;
+    } catch (const std::exception& error) {
+        if (host_.log) {
+            host_.log(host_.owner, 1, (std::string("Hidden AllStateSync hook unavailable: ") +
+                                       error.what()).c_str());
+        }
+        original_all_state_read = nullptr;
+        return false;
+    }
+}
+
+bool NativeCapture::install_preparation_hook() {
+    try {
+        void* method = runtime_.method(hidden_prep_class_, "Read", 1,
+                                       {"Torappu.DataStream.IStreamReader"});
+        std::uint32_t implementation = 0;
+        if ((runtime_.method_flags(method, &implementation) & 0x10u) ||
+            runtime_.type(runtime_.method_return(method)) != "System.Void" ||
+            runtime_.type(runtime_.method_param(method, 0)) != "Torappu.DataStream.IStreamReader") {
+            hook_diagnostics_.push_back("preparationStatusRead unavailable: ABI");
+            return false;
+        }
+        void* target = entry_point(method);
+        if (!il2cpp::is_executable(target)) {
+            hook_diagnostics_.push_back("preparationStatusRead unavailable: target");
+            return false;
+        }
+        const std::uint64_t id = host_.create_native_hook(
+            host_.owner, target, reinterpret_cast<void*>(NativeCapture::on_preparation_read),
+            reinterpret_cast<void**>(&original_preparation_read));
+        if (!id) return false;
+        hooks_.push_back(id);
+        if (!host_.enable_native_hook(host_.owner, id, true)) {
+            if (host_.remove_native_hook(host_.owner, id)) hooks_.pop_back();
+            original_preparation_read = nullptr;
+            hook_diagnostics_.push_back("preparationStatusRead unavailable: host hook");
+            return false;
+        }
+        hook_diagnostics_.push_back("preparationStatusRead installed");
+        return true;
+    } catch (const std::exception& error) {
+        if (host_.log) {
+            host_.log(host_.owner, 1, (std::string("Shop observation hook unavailable: ") +
+                                       error.what()).c_str());
+        }
+        original_preparation_read = nullptr;
+        return false;
+    }
+}
+
+IntelHiddenStore NativeCapture::read_hidden_store(void* store) const {
+    IntelHiddenStore result;
+    if (!store) return result;
+    result.available = true;
+    try { result.level = read_value<int>(store, hidden_store_level_field_, runtime_); } catch (...) {}
+    try { result.coin = read_value<int>(store, hidden_store_coin_field_, runtime_); } catch (...) {}
+    try {
+        result.upgrade_price = read_value<int>(store, hidden_store_upgrade_price_field_, runtime_);
+    } catch (...) {}
+    try {
+        result.refresh_price = read_value<int>(store, hidden_store_refresh_price_field_, runtime_);
+    } catch (...) {}
+    try { result.goods_type = read_value<int>(store, hidden_store_goods_type_field_, runtime_); } catch (...) {}
+    try {
+        result.free_refresh_count = read_value<int>(store, hidden_store_free_refresh_field_, runtime_);
+    } catch (...) {}
+    try {
+        result.special_refresh = read_value<bool>(store, hidden_store_special_refresh_field_, runtime_);
+    } catch (...) {}
+    try {
+        result.refresh_seq = read_value<int>(store, hidden_store_refresh_seq_field_, runtime_);
+        result.refresh_seq_available = true;
+    } catch (...) {}
+    try {
+        void* goods = read_object(store, hidden_store_goods_field_, runtime_);
+        result.goods_available = goods != nullptr;
+        result.goods = read_hidden_store_goods(goods);
+    } catch (...) {}
+    return result;
+}
+
+std::vector<IntelShopGood> NativeCapture::read_hidden_store_goods(void* sequence) const {
+    std::vector<IntelShopGood> result;
+    if (!sequence || !hidden_store_good_class_) return result;
+    const int count = runtime_.count(sequence);
+    const int bounded = (std::min)(count, static_cast<int>(kMaxIntelItems));
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            void* good = runtime_.at(sequence, i);
+            if (!good) continue;
+            IntelShopGood entry;
+            if (hidden_good_identifier_field_)
+                entry.chess_identifier = read_value<int>(good, hidden_good_identifier_field_, runtime_);
+            if (hidden_good_slot_field_) entry.slot_id = read_value<int>(good, hidden_good_slot_field_, runtime_);
+            if (hidden_good_price_field_) entry.price = read_value<int>(good, hidden_good_price_field_, runtime_);
+            if (hidden_good_frozen_field_)
+                entry.frozen = read_value<bool>(good, hidden_good_frozen_field_, runtime_);
+            const auto descriptor = describe_chess(entry.chess_identifier, 1);
+            if (descriptor.count == 0) continue;
+            entry.chess_id = descriptor.chess_id;
+            entry.operator_name = descriptor.operator_name;
+            entry.bond_ids = descriptor.bond_ids;
+            entry.bond_names = descriptor.bond_names;
+            entry.operator_available = descriptor.operator_available;
+            result.push_back(std::move(entry));
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
+IntelChessRecord NativeCapture::describe_chess(int identifier, int count) const {
+    // The Int32 GetChessBasicInfo overload takes a deployed instId, not a
+    // protocol chessIdentifier. The activity table provides the latter.
+    auto result = shop_catalog_entry(identifier);
+    if (result.operator_available || result.chess_id.empty()) result.count = count;
+    return result;
+}
+
+IntelChessRecord NativeCapture::describe_chess_info(void* boxed, int identifier, int count) const {
+    IntelChessRecord result;
+    result.chess_identifier = identifier;
+    result.count = count;
+    try {
+        if (!boxed || !runtime_.class_assignable(
+                chess_basic_info_class_, runtime_.object_class(boxed))) return result;
+        il2cpp::Runtime::Root boxed_root(runtime_, boxed);
+        const int item_type = read_value<int>(boxed_root.get(), basic_info_item_type_field_, runtime_);
+        if (item_type != item_type_char_) {
+            result.count = 0; // The descriptor identifies a non-character good.
+            return result;
+        }
+        void* char_id_object = read_object(boxed_root.get(), basic_info_char_id_field_, runtime_);
+        result.chess_id = runtime_.string(char_id_object);
+        if (result.chess_id.empty()) return result;
+        result.operator_available = true;
+        result.operator_name = resolve_operator_name(char_id_object, result.chess_id);
+        void* bonds = read_object(boxed_root.get(), basic_info_bonds_field_, runtime_);
+        if (bonds) {
+            const int bond_count = (std::min)(runtime_.count(bonds),
+                                              static_cast<int>(kMaxIntelItems));
+            result.bond_ids.reserve(static_cast<std::size_t>(bond_count));
+            result.bond_names.reserve(static_cast<std::size_t>(bond_count));
+            for (int i = 0; i < bond_count; ++i) {
+                try {
+                    void* bond_object = runtime_.at(bonds, i);
+                    const std::string bond_id = runtime_.string(bond_object);
+                    if (bond_id.empty()) continue;
+                    std::string bond_name;
+                    try {
+                        if (bond_info_method_) {
+                            void* bond_info = runtime_.invoke(bond_info_method_, nullptr, {bond_object});
+                            if (bond_info)
+                                bond_name = runtime_.string(read_object(
+                                    bond_info, bond_info_name_field_, runtime_));
+                        }
+                    } catch (...) {}
+                    result.bond_ids.push_back(bond_id);
+                    result.bond_names.push_back(std::move(bond_name));
+                } catch (...) {
+                }
+            }
+        }
+    } catch (...) {
+    }
+    return result;
+}
+
+std::string NativeCapture::resolve_boss_name(void* data_center, void* boss_id_object,
+                                            const std::string& boss_id) const {
+    if (!data_center || boss_id.empty() || !center_game_data_field_ || !enemy_handbook_data_info_)
+        return {};
+    try {
+        constexpr auto boss_type = "Torappu.AutoChessData.AutoChessBossInfoData";
+        constexpr auto enemy_type = "Torappu.EnemyHandBookData";
+        constexpr auto dictionary_prefix = "System.Collections.Generic.Dictionary<System.String,";
+        const auto reference = [&](void* object, const char* field_name, const std::string& type) {
+            if (!object) return static_cast<void*>(nullptr);
+            void* field = runtime_.field(runtime_.object_class(object), field_name);
+            return runtime_.type(runtime_.field_type(field)) == type
+                ? read_object(object, field, runtime_) : nullptr;
+        };
+        const auto instance_method = [&](void* object, const char* name, int arity,
+                                         const char* result_type,
+                                         const std::vector<std::string>& params = {}) {
+            void* method = runtime_.method(runtime_.checked_class(object), name, arity, params);
+            std::uint32_t impl = 0;
+            if ((runtime_.method_flags(method, &impl) & 0x10u) ||
+                (result_type && runtime_.type(runtime_.method_return(method)) != result_type))
+                throw std::runtime_error("Unexpected Boss name lookup signature");
+            return method;
+        };
+        const auto find = [&](void* dictionary, void* key, const char* value_type) -> void* {
+            if (!dictionary || !key) return nullptr;
+            void* lookup = instance_method(dictionary, "TryGetValue", 2, "System.Boolean",
+                                           {"System.String", std::string(value_type) + "&"});
+            void* value = nullptr;
+            return runtime_.unbox<bool>(runtime_.invoke(lookup, dictionary, {key, &value})) ? value : nullptr;
+        };
+
+        if (runtime_.type(runtime_.field_type(center_game_data_field_)) != "Torappu.AutoChessData")
+            return {};
+        il2cpp::Runtime::Root game_data(runtime_, read_object(data_center, center_game_data_field_, runtime_));
+        il2cpp::Runtime::Root bosses(runtime_, reference(
+            game_data.get(), "bossInfoDict", std::string(dictionary_prefix) + boss_type + ">"));
+        if (!bosses.get()) return {};
+
+        il2cpp::Runtime::Root key(runtime_, boss_id_object);
+        if (!key.get()) {
+            // A synchronized ID may precede the DataCenter getter. Reuse the
+            // matching managed dictionary key without constructing a string.
+            void* get_keys = instance_method(bosses.get(), "get_Keys", 0, nullptr);
+            il2cpp::Runtime::Root keys(runtime_, runtime_.invoke(get_keys, bosses.get()));
+            void* get_enumerator = instance_method(keys.get(), "GetEnumerator", 0, nullptr);
+            il2cpp::Runtime::Root enumerator(runtime_, runtime_.invoke(get_enumerator, keys.get()));
+            void* next = instance_method(enumerator.get(), "MoveNext", 0, "System.Boolean");
+            void* current = instance_method(enumerator.get(), "get_Current", 0, "System.String");
+            for (int i = 0; i < 256 && runtime_.unbox<bool>(runtime_.invoke(next, enumerator.get())); ++i) {
+                void* candidate = runtime_.invoke(current, enumerator.get());
+                if (runtime_.string(candidate) == boss_id) {
+                    key = il2cpp::Runtime::Root(runtime_, candidate);
+                    break;
+                }
+            }
+        }
+        il2cpp::Runtime::Root boss(runtime_, find(bosses.get(), key.get(), boss_type));
+        if (!boss.get()) return {};
+        il2cpp::Runtime::Root handbook(runtime_, runtime_.invoke(enemy_handbook_data_info_, nullptr));
+        il2cpp::Runtime::Root enemies(runtime_, reference(
+            handbook.get(), "enemyData", std::string(dictionary_prefix) + enemy_type + ">"));
+        for (const char* field : {"enemyId", "handbookEnemyId"}) {
+            il2cpp::Runtime::Root enemy_id(runtime_, reference(boss.get(), field, "System.String"));
+            const std::string id = runtime_.string(enemy_id.get());
+            if (id.empty()) continue;
+            il2cpp::Runtime::Root enemy(runtime_, find(enemies.get(), enemy_id.get(), enemy_type));
+            std::string name = runtime_.string(reference(enemy.get(), "name", "System.String"));
+            if (!name.empty() && name != id && name != boss_id) return name;
+        }
+    } catch (...) {
+    }
+    return {};
+}
+
+std::vector<IntelChessRecord> NativeCapture::read_hidden_chess_list(void* sequence) const {
+    std::vector<IntelChessRecord> result;
+    if (!sequence || !hidden_owned_identifier_field_) return result;
+    const int bounded = (std::min)(runtime_.count(sequence), static_cast<int>(kMaxIntelItems));
+    result.reserve(static_cast<std::size_t>(bounded));
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            void* chess = runtime_.at(sequence, i);
+            if (!chess) continue;
+            const int identifier = read_value<int>(chess, hidden_owned_identifier_field_, runtime_);
+            result.push_back(describe_chess(identifier, 1));
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
+std::vector<IntelChessRecord> NativeCapture::read_hidden_gained_list(void* sequence) const {
+    std::vector<IntelChessRecord> result;
+    if (!sequence) return result;
+    const int bounded = (std::min)(runtime_.count(sequence), static_cast<int>(kMaxIntelItems));
+    result.reserve(static_cast<std::size_t>(bounded));
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            void* gained = runtime_.at(sequence, i);
+            if (!gained) continue;
+            const int identifier = read_value<int>(gained, hidden_chess_identifier_field_, runtime_);
+            const int count = read_value<int>(gained, hidden_chess_count_field_, runtime_);
+            result.push_back(describe_chess(identifier, count));
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
+ShopObservation NativeCapture::read_shop_observation(void* preparation) const {
+    ShopObservation result;
+    if (!preparation) return result;
+    result.session_id = shop_session_id_.load(std::memory_order_acquire);
+    const int fallback_round = shop_round_.load(std::memory_order_acquire);
+    try { result.player_index = read_value<int>(preparation, hidden_prep_uid_field_, runtime_); }
+    catch (...) { return result; }
+    try { result.round = read_value<int>(preparation, hidden_prep_round_field_, runtime_); }
+    catch (...) { result.round = fallback_round; }
+    if (result.round <= 0) result.round = fallback_round;
+
+    try {
+        void* store = read_object(preparation, hidden_prep_store_field_, runtime_);
+        if (store) {
+            try {
+                result.refresh_seq = read_value<int>(store, hidden_store_refresh_seq_field_, runtime_);
+                result.refresh_seq_available = true;
+            } catch (...) {}
+            void* goods = read_object(store, hidden_store_goods_field_, runtime_);
+            result.goods_available = goods != nullptr;
+            if (goods) result.goods = read_hidden_store_goods(goods);
+        }
+    } catch (...) {}
+
+    try {
+        void* owned = read_object(preparation, hidden_prep_char_chess_field_, runtime_);
+        if (owned && hidden_owned_identifier_field_) {
+            result.owned = read_hidden_chess_list(owned);
+            result.owned_available = true;
+        }
+    } catch (...) {}
+
+    try {
+        void* analytics = read_object(preparation, hidden_prep_round_analytics_field_, runtime_);
+        if (analytics) {
+            void* gained = read_object(analytics, hidden_analytics_chess_gained_field_, runtime_);
+            if (gained && hidden_chess_identifier_field_ && hidden_chess_count_field_) {
+                result.gained = read_hidden_gained_list(gained);
+                result.gained_available = true;
+            }
+        }
+    } catch (...) {}
+    return result;
+}
+
+int NativeCapture::canonical_shop_player_slot(int raw_index) const noexcept {
+    const bool zero_based = shop_slot_mode_.load(std::memory_order_acquire) == 1;
+    if (zero_based)
+        return stronghold::canonical_shop_player_slot(raw_index, true);
+    return stronghold::canonical_shop_player_slot(raw_index, false);
+}
+
+void NativeCapture::capture_shop_observation(void* preparation) noexcept {
+    if (!preparation || !shop_session_id_.load(std::memory_order_acquire)) return;
+    try {
+        ShopObservation observation = read_shop_observation(preparation);
+        observation.player_index = canonical_shop_player_slot(observation.player_index);
+        if (is_shop_player_slot(observation.player_index) && observation.round > 0 &&
+            (observation.goods_available || observation.owned_available || observation.gained_available)) {
+            shop_observations_.fetch_add(1, std::memory_order_relaxed);
+            shop_hidden_observations_.fetch_add(1, std::memory_order_relaxed);
+            publish_shop_observation(std::move(observation));
+        } else shop_rejected_observations_.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        shop_rejected_observations_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void NativeCapture::on_preparation_read(void* self, void* reader, void* method) {
+    CallbackScope scope(g_callback_capture);
+    if (original_preparation_read) original_preparation_read(self, reader, method);
+    if (!scope.recording()) return;
+    try {
+        il2cpp::Runtime::Attachment attachment(scope.get()->runtime_);
+        scope.get()->capture_shop_observation(self);
+    } catch (...) {
+    }
+}
+
+void NativeCapture::capture_hidden_sync(void* all_state) noexcept {
+    HiddenSyncSnapshot snapshot;
+    if (!all_state) return;
+    snapshot.available = true;
+    snapshot.session_id = shop_session_id_.load(std::memory_order_acquire);
+    snapshot.captured_tick = GetTickCount64();
+    try {
+        snapshot.hidden_boss_id =
+            runtime_.string(read_raw_reference(all_state, hidden_boss_id_offset_));
+        snapshot.hidden_boss_available = true;
+        snapshot.stage_seed = read_raw_value<int>(all_state, hidden_stage_seed_offset_);
+        snapshot.stage_seed_available = true;
+
+        std::map<int, IntelHiddenPlayer> players;
+        void* static_players = read_raw_reference(all_state, hidden_static_players_offset_);
+        if (static_players && hidden_static_player_class_) {
+            const int count = runtime_.count(static_players);
+            const int bounded = (std::min)(count, static_cast<int>(kMaxPlayers));
+            for (int i = 0; i < bounded; ++i) {
+                try {
+                    void* player = runtime_.at(static_players, i);
+                    if (!player) continue;
+                    int index = -1;
+                    if (hidden_static_index_field_)
+                        index = read_value<int>(player, hidden_static_index_field_, runtime_);
+                    if (index < 0 || index >= static_cast<int>(kMaxPlayers)) continue;
+                    auto& entry = players[index];
+                    entry.index = index;
+                    if (hidden_static_band_field_)
+                        entry.band_id = runtime_.string(
+                            read_object(player, hidden_static_band_field_, runtime_));
+                    if (hidden_static_banned_units_field_) {
+                        entry.banned_units = read_banned_units(
+                            read_object(player, hidden_static_banned_units_field_, runtime_));
+                        entry.banned_units_available = true;
+                    }
+                } catch (...) {
+                }
+            }
+        }
+
+        void* scene = read_raw_reference(all_state, hidden_scene_detail_offset_);
+        if (scene) {
+            if (hidden_scene_state_field_) {
+                try {
+                    snapshot.scene_state =
+                        read_value<int>(scene, hidden_scene_state_field_, runtime_);
+                    snapshot.scene_state_available = true;
+                } catch (...) {}
+            }
+            if (hidden_scene_round_field_) {
+                try {
+                    snapshot.round = read_value<int>(scene, hidden_scene_round_field_, runtime_);
+                    snapshot.round_available = true;
+                } catch (...) {}
+            }
+            if (hidden_scene_runtime_players_field_) {
+                try {
+                    void* runtime_players =
+                        read_object(scene, hidden_scene_runtime_players_field_, runtime_);
+                    const int count = runtime_.count(runtime_players);
+                    const int bounded = (std::min)(count, static_cast<int>(kMaxPlayers));
+                    for (int i = 0; i < bounded; ++i) {
+                        try {
+                            void* runtime_player = runtime_.at(runtime_players, i);
+                            if (!runtime_player) continue;
+                            int index = -1;
+                            if (hidden_runtime_uid_field_)
+                                index = read_value<int>(runtime_player, hidden_runtime_uid_field_, runtime_);
+                            if (index < 0 || index >= static_cast<int>(kMaxPlayers)) continue;
+                            auto& entry = players[index];
+                            entry.index = index;
+                            if (hidden_runtime_shop_lv_field_) {
+                                entry.shop_level = read_value<int>(
+                                    runtime_player, hidden_runtime_shop_lv_field_, runtime_);
+                                entry.shop_level_available = true;
+                            }
+                            if (hidden_runtime_hp_field_) {
+                                entry.hp = read_value<int>(
+                                    runtime_player, hidden_runtime_hp_field_, runtime_);
+                                entry.hp_available = true;
+                            }
+                            if (hidden_runtime_state_field_) {
+                                entry.game_state = read_value<int>(
+                                    runtime_player, hidden_runtime_state_field_, runtime_);
+                                entry.game_state_available = true;
+                            }
+                        } catch (...) {
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+            if (hidden_scene_prep_status_field_) {
+                try {
+                    void* preparation =
+                        read_object(scene, hidden_scene_prep_status_field_, runtime_);
+                    const int count = runtime_.count(preparation);
+                    const int bounded = (std::min)(count, static_cast<int>(kMaxPlayers));
+                    for (int i = 0; i < bounded; ++i) {
+                        try {
+                            void* prep = runtime_.at(preparation, i);
+                            if (!prep) continue;
+                            int index = -1;
+                            if (hidden_prep_uid_field_)
+                                index = read_value<int>(prep, hidden_prep_uid_field_, runtime_);
+                            if (index < 0 || index >= static_cast<int>(kMaxPlayers)) continue;
+                            auto& entry = players[index];
+                            entry.index = index;
+                            if (hidden_prep_store_field_) {
+                                entry.store = read_hidden_store(
+                                    read_object(prep, hidden_prep_store_field_, runtime_));
+                            }
+                            if (hidden_prep_char_chess_field_) {
+                                void* owned = read_object(prep, hidden_prep_char_chess_field_, runtime_);
+                                if (owned && hidden_owned_identifier_field_) {
+                                    entry.owned = read_hidden_chess_list(owned);
+                                    entry.owned_available = true;
+                                }
+                            }
+                            if (hidden_prep_round_analytics_field_) {
+                                void* analytics = read_object(
+                                    prep, hidden_prep_round_analytics_field_, runtime_);
+                                if (analytics) {
+                                    void* gained = read_object(
+                                        analytics, hidden_analytics_chess_gained_field_, runtime_);
+                                    if (gained && hidden_chess_identifier_field_ && hidden_chess_count_field_) {
+                                        entry.gained = read_hidden_gained_list(gained);
+                                        entry.gained_available = true;
+                                    }
+                                }
+                            }
+                            if (entry.store.available) {
+                                entry.shop_level = entry.store.level;
+                                entry.shop_level_available = true;
+                            }
+                            ShopObservation observation;
+                            observation.session_id = snapshot.session_id;
+                            observation.player_index = canonical_shop_player_slot(index);
+                            observation.round = snapshot.round_available && snapshot.round > 0
+                                ? snapshot.round : shop_round_.load(std::memory_order_acquire);
+                            try {
+                                const int prep_round = read_value<int>(
+                                    prep, hidden_prep_round_field_, runtime_);
+                                if (prep_round > 0) observation.round = prep_round;
+                            } catch (...) {}
+                            observation.refresh_seq = entry.store.refresh_seq;
+                            observation.refresh_seq_available = entry.store.refresh_seq_available;
+                            observation.goods_available = entry.store.goods_available;
+                            observation.goods = entry.store.goods;
+                            observation.owned_available = entry.owned_available;
+                            observation.owned = entry.owned;
+                            observation.gained_available = entry.gained_available;
+                            observation.gained = entry.gained;
+                            if (observation.session_id &&
+                                is_shop_player_slot(observation.player_index) &&
+                                observation.round > 0 &&
+                                (observation.goods_available || observation.owned_available ||
+                                 observation.gained_available)) {
+                                shop_observations_.fetch_add(1, std::memory_order_relaxed);
+                                shop_hidden_observations_.fetch_add(1, std::memory_order_relaxed);
+                                publish_shop_observation(std::move(observation));
+                            } else {
+                                shop_rejected_observations_.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        } catch (...) {
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+        }
+        snapshot.players.reserve(players.size());
+        for (auto& [index, player] : players) {
+            (void)index;
+            snapshot.players.push_back(std::move(player));
+        }
+    } catch (...) {
+        snapshot.available = true;
+    }
+    publish_hidden_sync(std::move(snapshot));
 }
 
 bool NativeCapture::shutdown_locked() {
@@ -940,6 +2254,8 @@ bool NativeCapture::shutdown_locked() {
     original_update = nullptr;
     original_global_update = nullptr;
     original_applied_modifier = nullptr;
+    original_all_state_read = nullptr;
+    original_preparation_read = nullptr;
     runtime_card_root_ = il2cpp::Runtime::Root{};
     inst_player_root_ = il2cpp::Runtime::Root{};
     token_card_root_ = il2cpp::Runtime::Root{};
@@ -1341,6 +2657,43 @@ bool NativeCapture::read_player(void* player_model, int index, PlayerInfo& info,
     info.uid = runtime_.string(read_object(player, scene_uid_field_, runtime_));
     void* card = read_object(player, scene_card_field_, runtime_);
     info.name = card ? runtime_.string(read_object(card, card_nickname_field_, runtime_)) : "";
+    info.band_id.clear();
+    info.band_available = false;
+    if (scene_band_field_) {
+        try {
+            info.band_id = runtime_.string(read_object(player, scene_band_field_, runtime_));
+            info.band_available = true;
+        } catch (...) {
+        }
+    }
+    info.squad_slots.clear();
+    info.squad_available = false;
+    if (scene_squad_slots_field_) {
+        try {
+            info.squad_available =
+                read_squad_slots(read_object(player, scene_squad_slots_field_, runtime_),
+                                 info.squad_slots);
+        } catch (...) {
+        }
+    }
+    info.shop_level = 0;
+    info.shop_level_available = false;
+    if (scene_shop_level_field_) {
+        try {
+            info.shop_level = read_value<int>(player, scene_shop_level_field_, runtime_);
+            info.shop_level_available = true;
+        } catch (...) {
+        }
+    }
+    info.shop_coin = 0;
+    info.shop_coin_available = false;
+    if (scene_shop_coin_field_) {
+        try {
+            info.shop_coin = read_value<int>(player, scene_shop_coin_field_, runtime_);
+            info.shop_coin_available = true;
+        } catch (...) {
+        }
+    }
     int scene_index = read_value<int>(player, scene_index_field_, runtime_);
     if (scene_index != index || scene_index < 0 || scene_index >= static_cast<int>(kMaxPlayers))
         throw std::runtime_error("GetPlayerData returned a different/invalid player slot");
@@ -1354,6 +2707,360 @@ bool NativeCapture::read_player(void* player_model, int index, PlayerInfo& info,
     info.game_finished = game_finished;
     info.dead = runtime_.unbox<bool>(runtime_.invoke(scene_dead_info_, player));
     return !info.uid.empty() || !info.name.empty();
+}
+
+std::vector<IntelBannedUnit> NativeCapture::read_banned_units(void* sequence) const {
+    std::vector<IntelBannedUnit> result;
+    if (!sequence || !banned_unit_class_) return result;
+    const int count = runtime_.count(sequence);
+    const int bounded = (std::min)(count, static_cast<int>(kMaxIntelItems));
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            void* unit = runtime_.at(sequence, i);
+            if (!unit) continue;
+            IntelBannedUnit entry;
+            if (banned_unit_bond_id_field_) {
+                try {
+                    entry.bond_id = runtime_.string(
+                        read_object(unit, banned_unit_bond_id_field_, runtime_));
+                } catch (...) {
+                }
+            }
+            if (banned_unit_chess_ids_field_) {
+                try {
+                    void* identifiers = read_object(unit, banned_unit_chess_ids_field_, runtime_);
+                    if (identifiers) {
+                        const int id_count = runtime_.count(identifiers);
+                        const int id_bounded =
+                            (std::min)(id_count, static_cast<int>(kMaxIntelItems));
+                        for (int j = 0; j < id_bounded; ++j) {
+                            try {
+                                entry.chess_identifiers.push_back(
+                                    runtime_.unbox<int>(runtime_.at(identifiers, j)));
+                            } catch (...) {
+                            }
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+            if (!entry.bond_id.empty() || !entry.chess_identifiers.empty())
+                result.push_back(std::move(entry));
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
+bool NativeCapture::read_squad_slots(void* sequence,
+                                      std::vector<IntelSquadSlot>& result) const {
+    result.clear();
+    if (!squad_slot_class_) return false;
+    if (!sequence) return true;
+    const int count = runtime_.count(sequence);
+    const int bounded = (std::min)(count, 16);
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            void* slot = runtime_.at(sequence, i);
+            if (!slot) continue;
+            IntelSquadSlot entry;
+            const auto read_text = [&](void* field) -> std::string {
+                if (!field) return {};
+                try {
+                    return runtime_.string(read_object(slot, field, runtime_));
+                } catch (...) {
+                    return {};
+                }
+            };
+            entry.char_id = read_text(squad_char_id_field_);
+            entry.chess_id = read_text(squad_chess_id_field_);
+            entry.template_id = read_text(squad_template_id_field_);
+            entry.cultivate_effect_id = read_text(squad_cultivate_effect_id_field_);
+            entry.equip_id = read_text(squad_equip_id_field_);
+            entry.skin_id = read_text(squad_skin_id_field_);
+            if (squad_type_field_) {
+                try {
+                    entry.type = read_value<int>(slot, squad_type_field_, runtime_);
+                } catch (...) {
+                }
+            }
+            if (squad_potential_rank_field_) {
+                try {
+                    entry.potential_rank = read_value<int>(slot, squad_potential_rank_field_, runtime_);
+                } catch (...) {
+                }
+            }
+            if (squad_skill_index_field_) {
+                try {
+                    entry.skill_index = read_value<int>(slot, squad_skill_index_field_, runtime_);
+                } catch (...) {
+                }
+            }
+            if (squad_bond_ids_field_) {
+                try {
+                    void* bonds = read_object(slot, squad_bond_ids_field_, runtime_);
+                    if (bonds) {
+                        const int bond_count = runtime_.count(bonds);
+                        const int bond_bounded =
+                            (std::min)(bond_count, static_cast<int>(kMaxIntelItems));
+                        for (int j = 0; j < bond_bounded; ++j) {
+                            try {
+                                std::string bond = runtime_.string(runtime_.at(bonds, j));
+                                if (!bond.empty()) entry.bond_ids.push_back(std::move(bond));
+                            } catch (...) {
+                            }
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+            if (squad_banned_field_) {
+                try {
+                    entry.banned = read_value<bool>(slot, squad_banned_field_, runtime_);
+                    entry.banned_available = true;
+                } catch (...) {
+                }
+            }
+            if (!entry.char_id.empty() || !entry.chess_id.empty() ||
+                !entry.template_id.empty() || !entry.cultivate_effect_id.empty() ||
+                !entry.equip_id.empty() || !entry.skin_id.empty() || !entry.bond_ids.empty() ||
+                entry.type >= 0 || entry.potential_rank >= 0 || entry.skill_index >= 0 ||
+                entry.banned_available) {
+                result.push_back(std::move(entry));
+            }
+        } catch (...) {
+        }
+    }
+    return true;
+}
+
+std::vector<IntelShopGood> NativeCapture::read_shop_goods(void* sequence, bool& slot_ids_available) const {
+    std::vector<IntelShopGood> result;
+    if (!sequence || !shop_goods_class_ || !shop_good_chess_id_field_) return result;
+    slot_ids_available = shop_good_slot_id_field_ != nullptr;
+    const int count = runtime_.count(sequence);
+    const int bounded = (std::min)(count, static_cast<int>(kMaxIntelItems));
+    std::set<int> used_slots;
+    for (int i = 0; i < bounded; ++i) {
+        try {
+            void* good = runtime_.at(sequence, i);
+            if (!good) continue;
+            IntelShopGood entry;
+            entry.slot_id = i;
+            if (shop_good_slot_id_field_) {
+                try { entry.slot_id = read_value<int>(good, shop_good_slot_id_field_, runtime_); }
+                catch (...) { slot_ids_available = false; }
+            }
+            if (entry.slot_id < 0 || !used_slots.insert(entry.slot_id).second)
+                slot_ids_available = false;
+            if (shop_good_price_field_) {
+                try { entry.price = read_value<int>(good, shop_good_price_field_, runtime_); }
+                catch (...) {}
+            }
+            if (shop_good_frozen_field_) {
+                try { entry.frozen = read_value<bool>(good, shop_good_frozen_field_, runtime_); }
+                catch (...) {}
+            }
+            void* chess_id_object = read_object(good, shop_good_chess_id_field_, runtime_);
+            entry.chess_id = runtime_.string(chess_id_object);
+            if (entry.chess_id.empty()) continue;
+            // The local ShopData path exposes the stable chessId string rather
+            // than the protocol's chessIdentifier. It is still sufficient to
+            // count an observed operator even when the optional descriptor
+            // lookup is unavailable.
+            auto descriptor = shop_catalog_entry(0, entry.chess_id);
+            if (!descriptor.operator_available && !descriptor.chess_id.empty()) continue;
+            if (chess_basic_info_by_id_method_) {
+                try {
+                    auto live = describe_chess_info(runtime_.invoke(
+                        chess_basic_info_by_id_method_, nullptr, {chess_id_object}), 0, 1);
+                    if (live.operator_available) {
+                        if (live.chess_id == descriptor.chess_id) {
+                            if (live.operator_name.empty()) live.operator_name = descriptor.operator_name;
+                            if (live.bond_ids.empty()) {
+                                live.bond_ids = std::move(descriptor.bond_ids);
+                                live.bond_names = std::move(descriptor.bond_names);
+                            } else {
+                                for (std::size_t bond = 0; bond < live.bond_ids.size(); ++bond) {
+                                    if (!live.bond_names[bond].empty()) continue;
+                                    const auto configured_id = std::find(descriptor.bond_ids.begin(),
+                                        descriptor.bond_ids.end(), live.bond_ids[bond]);
+                                    if (configured_id != descriptor.bond_ids.end())
+                                        live.bond_names[bond] = descriptor.bond_names[
+                                            configured_id - descriptor.bond_ids.begin()];
+                                }
+                            }
+                        }
+                        descriptor = std::move(live);
+                    }
+                    else if (live.count == 0 && !descriptor.operator_available) continue;
+                } catch (...) {}
+            }
+            if (descriptor.operator_available) {
+                entry.chess_id = std::move(descriptor.chess_id);
+                entry.operator_name = std::move(descriptor.operator_name);
+                entry.bond_ids = std::move(descriptor.bond_ids);
+                entry.bond_names = std::move(descriptor.bond_names);
+                entry.operator_available = true;
+            }
+            if (entry.operator_name.empty()) {
+                entry.operator_name = resolve_operator_name(chess_id_object, entry.chess_id);
+            }
+            result.push_back(std::move(entry));
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
+void NativeCapture::refresh_match_intel(void* data_center,
+                                        const std::vector<PlayerInfo>& players,
+                                        int stage_seed) {
+    MatchIntelSnapshot snapshot;
+    snapshot.available = data_center != nullptr;
+    snapshot.session_id = session_id_;
+    snapshot.round = static_cast<std::uint32_t>(current_round_);
+    snapshot.stage_seed = stage_seed;
+    snapshot.stage_seed_available = data_center != nullptr;
+    bool shop_refresh_seq_available = false;
+    bool shop_slot_ids_available = false;
+    if (data_center) {
+        const auto read_text = [&](void* method, bool& available) -> std::string {
+            if (!method) return {};
+            try {
+                std::string value = runtime_.string(runtime_.invoke(method, data_center));
+                available = true;
+                return value;
+            } catch (...) {
+                return {};
+            }
+        };
+        const auto read_list = [&](void* method, std::vector<std::string>& target,
+                                   bool& available) {
+            if (!method) return;
+            try {
+                append_string_list(runtime_, runtime_.invoke(method, data_center), target);
+                available = true;
+            } catch (...) {
+            }
+        };
+        snapshot.stage_id = read_text(center_stage_id_info_, snapshot.stage_available);
+        snapshot.mode_id = read_text(center_mode_id_info_, snapshot.mode_available);
+        snapshot.boss_id = read_text(center_boss_id_info_, snapshot.boss_available);
+        il2cpp::Runtime::Root local_boss_key;
+        try {
+            if (center_hidden_boss_id_info_)
+                local_boss_key = il2cpp::Runtime::Root(
+                    runtime_, runtime_.invoke(center_hidden_boss_id_info_, data_center));
+            snapshot.hidden_boss_id = runtime_.string(local_boss_key.get());
+        } catch (...) {}
+        void* matching_boss_key = local_boss_key.get();
+        {
+            std::lock_guard lock(g_hidden_sync_mutex);
+            if (g_hidden_sync.available && g_hidden_sync.session_id == snapshot.session_id &&
+                g_hidden_sync.hidden_boss_available && !g_hidden_sync.hidden_boss_id.empty() &&
+                g_hidden_sync.hidden_boss_id != snapshot.hidden_boss_id) {
+                snapshot.hidden_boss_id = g_hidden_sync.hidden_boss_id;
+                matching_boss_key = nullptr;
+            }
+        }
+        snapshot.hidden_boss_available = !snapshot.hidden_boss_id.empty();
+        snapshot.hidden_boss_name = resolve_boss_name(data_center, matching_boss_key, snapshot.hidden_boss_id);
+        snapshot.hidden_boss_name_available = !snapshot.hidden_boss_name.empty();
+        read_list(center_enemy_types_info_, snapshot.enemy_types,
+                  snapshot.enemy_types_available);
+        read_list(center_banned_bonds_info_, snapshot.banned_bonds,
+                  snapshot.banned_bonds_available);
+        if (center_self_banned_units_info_) {
+            try {
+                snapshot.self_banned_units =
+                    read_banned_units(runtime_.invoke(center_self_banned_units_info_, data_center));
+                snapshot.self_banned_units_available = true;
+            } catch (...) {
+            }
+        }
+        if (center_shop_model_field_) {
+            try {
+                void* shop = read_object(data_center, center_shop_model_field_, runtime_);
+                if (shop) {
+                    snapshot.shop_available = true;
+                    snapshot.shop_core_available = shop_goods_field_ && shop_goods_class_ &&
+                        shop_good_chess_id_field_;
+                    try { if (shop_level_field_)
+                        snapshot.shop_level = read_value<int>(shop, shop_level_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_coin_field_)
+                        snapshot.shop_coin = read_value<int>(shop, shop_coin_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_upgrade_field_)
+                        snapshot.shop_upgrade_price = read_value<int>(shop, shop_upgrade_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_refresh_field_)
+                        snapshot.shop_refresh_price = read_value<int>(shop, shop_refresh_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_goods_type_field_)
+                        snapshot.shop_goods_type = read_value<int>(shop, shop_goods_type_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_free_refresh_field_)
+                        snapshot.shop_free_refresh_count = read_value<int>(shop, shop_free_refresh_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_special_refresh_field_)
+                        snapshot.shop_special_refresh = read_value<bool>(shop, shop_special_refresh_field_, runtime_);
+                    } catch (...) {}
+                    try { if (shop_refresh_seq_field_) {
+                        snapshot.shop_refresh_seq = read_value<int>(shop, shop_refresh_seq_field_, runtime_);
+                        shop_refresh_seq_available = snapshot.shop_refresh_seq >= 0;
+                    }} catch (...) {}
+                    try {
+                        void* goods = shop_goods_field_
+                            ? read_object(shop, shop_goods_field_, runtime_) : nullptr;
+                        if (goods && snapshot.shop_core_available) {
+                            snapshot.shop_goods = read_shop_goods(goods, shop_slot_ids_available);
+                            snapshot.shop_goods_available = true;
+                        }
+                    } catch (...) { snapshot.shop_goods_available = false; }
+                }
+            } catch (...) {
+                snapshot.shop_core_available = false;
+                snapshot.shop_goods_available = false;
+            }
+        }
+    }
+    if (snapshot.shop_available && snapshot.shop_goods_available && snapshot.shop_core_available) {
+        ShopObservation observation;
+        observation.session_id = shop_session_id_.load(std::memory_order_acquire);
+        observation.round = current_round_ > 0 ? current_round_ : 1;
+        observation.player_index = canonical_shop_player_slot(self_index_);
+        observation.refresh_seq = snapshot.shop_refresh_seq;
+        observation.refresh_seq_available = shop_refresh_seq_available;
+        observation.slot_ids_available = shop_slot_ids_available;
+        observation.goods_available = true;
+        observation.goods = snapshot.shop_goods;
+        if (observation.session_id && is_shop_player_slot(observation.player_index)) {
+            shop_observations_.fetch_add(1, std::memory_order_relaxed);
+            shop_local_observations_.fetch_add(1, std::memory_order_relaxed);
+            publish_shop_observation(std::move(observation));
+        } else {
+            shop_rejected_observations_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    snapshot.players.reserve(players.size());
+    for (const PlayerInfo& player : players) {
+        IntelPlayer entry;
+        entry.index = player.index;
+        entry.self = player.self;
+        entry.name = player.name;
+        entry.band_id = player.band_id;
+        entry.band_available = player.band_available;
+        entry.squad_slots = player.squad_slots;
+        entry.squad_available = player.squad_available;
+        entry.shop_level = player.shop_level;
+        entry.shop_level_available = player.shop_level_available;
+        entry.shop_coin = player.shop_coin;
+        entry.shop_coin_available = player.shop_coin_available;
+        snapshot.players.push_back(std::move(entry));
+    }
+    publish_match_intel(std::move(snapshot));
 }
 
 void NativeCapture::read_players(void* player_model, int self_index,
@@ -1460,7 +3167,11 @@ void NativeCapture::snapshot_diagnostics() noexcept {
         << "filters outside_mode=" << counters_.outside_mode << " cancelled=" << counters_.cancelled
         << " wrong_type=" << counters_.wrong_type << " unresolved_source=" << counters_.unresolved_source
         << " environment=" << counters_.environment << " zero=" << counters_.zero
-        << " exceptions=" << counters_.errors << " roster_errors=" << counters_.roster_errors << '\n';
+        << " exceptions=" << counters_.errors << " roster_errors=" << counters_.roster_errors << '\n'
+        << "shop observations=" << shop_observations_.load(std::memory_order_relaxed)
+        << " local=" << shop_local_observations_.load(std::memory_order_relaxed)
+        << " hidden=" << shop_hidden_observations_.load(std::memory_order_relaxed)
+        << " rejected=" << shop_rejected_observations_.load(std::memory_order_relaxed) << '\n';
     std::ostringstream state;
     state << "mode_present=" << mode_present_ << " capture_active=" << in_mode_
         << " session=" << session_id_ << " round=" << current_round_ << " self_slot=" << self_index_ << '\n'
@@ -1531,6 +3242,8 @@ void NativeCapture::leave_mode() {
         snapshot_diagnostics();
         publish_session_end();
     }
+    shop_session_id_.store(0, std::memory_order_release);
+    stop_shop_observations();
     mode_present_ = false;
     in_mode_ = false;
     logged_coverage_ = Coverage::Unknown;
@@ -1573,7 +3286,11 @@ void NativeCapture::leave_mode() {
 }
 
 void NativeCapture::publish_session_start(bool partial) {
+    shop_session_id_.store(0, std::memory_order_release);
     session_id_ = (GetTickCount64() << 16) ^ ++session_counter_;
+    reset_shop_observations(session_id_);
+    shop_round_.store(current_round_, std::memory_order_release);
+    reset_hidden_sync_for_session(session_id_);
     coverage_warning_sent_ = false;
     session_end_published_ = false;
     reset_timing();
@@ -1583,9 +3300,11 @@ void NativeCapture::publish_session_start(bool partial) {
     event.round = static_cast<std::uint32_t>(current_round_);
     event.partial = partial ? 1u : 0u;
     g_events.publish(event);
+    shop_session_id_.store(session_id_, std::memory_order_release);
 }
 
 void NativeCapture::publish_round_start() {
+    shop_round_.store(current_round_, std::memory_order_release);
     phase_published_ = false;
     last_damage_phase_ = BattlePhase::Idle;
     last_damage_clock_ = -1;
@@ -1913,6 +3632,14 @@ void NativeCapture::tick_runtime(bool force) {
     int resolved_self = self_index;
     std::string self_uid;
     read_players(player_model, self_index, players, resolved_self, self_uid);
+    bool roster_has_zero = false;
+    bool roster_has_four = false;
+    for (const PlayerInfo& player : players) {
+        roster_has_zero = roster_has_zero || player.index == 0;
+        roster_has_four = roster_has_four || player.index == 4;
+    }
+    shop_slot_mode_.store(roster_has_zero && !roster_has_four ? 1 : 0,
+                          std::memory_order_release);
     if (players.empty()) {
         set_error("AutoChess player roster is unavailable; capture paused");
         active_mask_ = 0;
@@ -2047,6 +3774,14 @@ void NativeCapture::tick_runtime(bool force) {
             self_uid_ = self_uid;
         }
         current_round_ = round;
+        shop_session_id_.store(0, std::memory_order_release);
+        {
+            std::lock_guard lock(shop_catalog_mutex_);
+            shop_catalog_.clear();
+            shop_catalog_ids_.clear();
+        }
+        shop_catalog_next_sample_ = 0;
+        refresh_shop_catalog(data_center);
         publish_session_start(false);
         if (manual_reset) g_reset_requested.store(false);
         publish_round_start();
@@ -2068,6 +3803,8 @@ void NativeCapture::tick_runtime(bool force) {
     simulated_mask_ = effective_mask;
     active_mask_ = active_mask;
     in_mode_ = true;
+    refresh_shop_catalog(data_center);
+    refresh_match_intel(data_center, players, stage_seed);
     publish_roster(players);
     publish_coverage(effective_mask, active_mask);
     sample_timing();
@@ -2449,6 +4186,20 @@ void NativeCapture::record_damage(void* logger, void* modifier, bool elemental, 
     }
 }
 
+void NativeCapture::on_all_state_read(void* self, void* reader, void* method) {
+    CallbackScope scope(g_callback_capture);
+    if (original_all_state_read) {
+        original_all_state_read(self, reader, method);
+    }
+    if (scope.recording()) {
+        try {
+            il2cpp::Runtime::Attachment attachment(scope.get()->runtime_);
+            scope.get()->capture_hidden_sync(self);
+        } catch (...) {
+        }
+    }
+}
+
 void NativeCapture::on_log_modifier(void* self, void* modifier, void* method) {
     CallbackScope scope(g_callback_capture);
     const auto phase = scope.recording() ? scope.get()->read_damage_phase() : BattlePhase::Idle;
@@ -2589,6 +4340,29 @@ std::string capture_diagnostics() {
     return g_diagnostics;
 }
 
+MatchIntelSnapshot capture_match_intel() {
+    std::lock_guard lock(g_match_intel_mutex);
+    return g_match_intel;
+}
+
+HiddenSyncSnapshot capture_hidden_sync() {
+    std::lock_guard lock(g_hidden_sync_mutex);
+    return g_hidden_sync;
+}
+
+ShopObservationBatch drain_shop_observations() {
+    ShopObservationBatch batch;
+    std::lock_guard lock(g_shop_observation_mutex);
+    batch.incomplete = g_shop_observations_overrun;
+    batch.observations.reserve(g_shop_observations.size());
+    while (!g_shop_observations.empty()) {
+        batch.observations.push_back(std::move(g_shop_observations.front()));
+        g_shop_observations.pop_front();
+    }
+    g_shop_observations_overrun = false;
+    return batch;
+}
+
 bool initialize_capture(const ArkPluginApiV1* host) {
     if (!host) {
         return false;
@@ -2598,6 +4372,9 @@ bool initialize_capture(const ArkPluginApiV1* host) {
     if (g_active_capture) {
         return true;
     }
+    clear_match_intel();
+    clear_hidden_sync();
+    reset_shop_observations(0);
     if (g_pending_capture) {
         if (!g_pending_capture->shutdown()) {
             return false;

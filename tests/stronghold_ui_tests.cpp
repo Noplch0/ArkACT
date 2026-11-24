@@ -14,6 +14,8 @@ std::map<std::string, Item> items;
 std::string frame_text;
 bool ready = true;
 bool reset_requested = false;
+std::vector<ark::stronghold::ShopObservation> shop_observations;
+bool shop_observation_overrun = false;
 ark::stronghold::EventQueue queue;
 }
 
@@ -38,6 +40,17 @@ bool UnityInput::shutdown() { return true; }
 }
 namespace ark::stronghold {
 EventQueue& event_queue() { return queue; }
+MatchIntelSnapshot intel_snapshot;
+MatchIntelSnapshot capture_match_intel() { return intel_snapshot; }
+HiddenSyncSnapshot hidden_snapshot;
+HiddenSyncSnapshot capture_hidden_sync() { return hidden_snapshot; }
+ShopObservationBatch drain_shop_observations() {
+    ShopObservationBatch batch;
+    batch.observations.swap(shop_observations);
+    batch.incomplete = shop_observation_overrun;
+    shop_observation_overrun = false;
+    return batch;
+}
 bool initialize_capture(const ArkPluginApiV1*) { return ready; }
 bool shutdown_capture() { return true; }
 bool capture_ready() { return ready; }
@@ -79,6 +92,7 @@ void clock_event(std::uint32_t round, BattlePhase phase, double seconds) {
 }
 void setup_model() {
     queue.clear(); g_cursor = 0; g_model = StatsModel{}; g_reports = ReportArchive{};
+    g_shop_counter.reset(); shop_observations.clear(); shop_observation_overrun = false;
     g_selection.reset(); g_mode_active = false; g_reset_pending = false;
     g_runtime_error.clear(); g_capture_error.clear(); g_input_error.clear();
     g_export_status.clear(); g_queue_partial = false; g_interrupted_report = false;
@@ -153,6 +167,36 @@ void check_layout(float width, float height) {
     CHECK(grid->OuterRect.Max.y <= parent->InnerRect.Max.y);
     CHECK(parent->ScrollMax.y < 1.f);
     CHECK(grid->FreezeRowsRequest == 1);
+}
+
+void test_idle_window_before_session() {
+    queue.clear();
+    g_cursor = 0;
+    g_model = StatsModel{};
+    g_mode_active = false;
+    ready = false;
+    g_input_ready = false;
+    g_reset_pending = false;
+    g_runtime_error.clear();
+    g_capture_error.clear();
+    g_input_error.clear();
+    g_export_status.clear();
+
+    frame();
+    CHECK(ImGui::FindWindowByName(window_name) != nullptr);
+    frame(true);
+    CHECK(frame_text.find("插件已加载") != std::string::npos);
+    CHECK(frame_text.find("尚未开始对局") != std::string::npos);
+
+    ready = true;
+    g_input_ready = true;
+    frame();
+    frame(true);
+    CHECK(frame_text.find("运行时与输入已就绪") != std::string::npos);
+
+    ready = true;
+    g_input_ready = true;
+    std::puts("PASS idle window before first session / runtime-ready wait state");
 }
 
 void test_selection_and_lifecycle() {
@@ -242,6 +286,96 @@ void test_actual_buttons_and_layout() {
     std::puts("PASS actual scope / phase / previous-next buttons / labels / compact table geometry");
 }
 
+void test_match_identity_and_shop_counter_tabs() {
+    setup_model();
+    intel_snapshot = MatchIntelSnapshot{};
+    intel_snapshot.available = true;
+    intel_snapshot.session_id = g_model.session_id();
+    intel_snapshot.stage_seed = 123456;
+    intel_snapshot.stage_seed_available = true;
+    intel_snapshot.hidden_boss_id = "boss_16";
+    intel_snapshot.hidden_boss_available = true;
+    intel_snapshot.hidden_boss_name = "隐藏首领名";
+    intel_snapshot.hidden_boss_name_available = true;
+
+    frame(true);
+    CHECK(frame_text.find("种子：123456") != std::string::npos);
+    CHECK(frame_text.find("Boss：隐藏首领名") != std::string::npos);
+    CHECK(frame_text.find("boss_16") == std::string::npos);
+    CHECK(frame_text.find("出怪预览") == std::string::npos);
+
+    hidden_snapshot = HiddenSyncSnapshot{};
+    hidden_snapshot.available = true;
+    hidden_snapshot.session_id = g_model.session_id();
+    hidden_snapshot.hidden_boss_available = true;
+    hidden_snapshot.hidden_boss_id = "different-boss";
+    frame(true);
+    CHECK(frame_text.find("Boss：名称未读取") != std::string::npos);
+    CHECK(frame_text.find("隐藏首领名") == std::string::npos);
+    CHECK(frame_text.find("different-boss") == std::string::npos);
+    hidden_snapshot = HiddenSyncSnapshot{};
+
+    ShopObservation observation;
+    observation.session_id = g_model.session_id();
+    observation.round = 1;
+    observation.player_index = 1;
+    observation.refresh_seq = 1;
+    observation.refresh_seq_available = true;
+    observation.goods_available = true;
+    IntelShopGood good;
+    good.slot_id = 0;
+    good.chess_id = "char-a";
+    good.operator_name = "干员甲";
+    good.bond_ids = {"bond-a", "bond-b"};
+    good.bond_names = {"盟约甲", "盟约乙"};
+    good.operator_available = true;
+    observation.goods = {good};
+    shop_observations.push_back(observation);
+    observation.player_index = 4;
+    for (int slot = 1; slot < 3; ++slot) {
+        good.slot_id = slot;
+        observation.goods.push_back(good);
+    }
+    shop_observations.push_back(observation);
+    pump_events();
+
+    click("记牌器##main_tab");
+    frame(true);
+    CHECK(items.contains("出现频率##counter_view"));
+    CHECK(frame_text.find("| 干员甲 | 4 | 1 | 0 | 0 | 3 |") != std::string::npos);
+    CHECK(frame_text.find("P1") != std::string::npos);
+    CHECK(frame_text.find("出怪预览") == std::string::npos);
+
+    click("玩家##counter_player");
+    click("P1");
+    CHECK(g_counter_player_filter == 1);
+    frame(true);
+    CHECK(frame_text.find("| 名称 | 出现次数 |") != std::string::npos);
+    CHECK(frame_text.find("| 干员甲 | 1 |") != std::string::npos);
+    CHECK(frame_text.find("| P4 |") == std::string::npos);
+
+    click("盟约##counter_dimension");
+    frame(true);
+    CHECK(frame_text.find("| 盟约甲 | 1 |") != std::string::npos);
+    CHECK(frame_text.find("| 盟约乙 | 1 |") != std::string::npos);
+    click("玩家##counter_player");
+    click("全体");
+    CHECK(g_counter_player_filter == -1);
+    frame(true);
+    CHECK(frame_text.find("| 盟约甲 | 4 | 1 | 0 | 0 | 3 |") != std::string::npos);
+    click("玩家干员##counter_view");
+    frame(true);
+    CHECK(frame_text.find("推定卖出") != std::string::npos);
+    CHECK(frame_text.find("其中商店") != std::string::npos);
+
+    publish(make_event(EventKind::SessionStart, 1, 200));
+    CHECK(!g_counter_view);
+    CHECK(g_shop_counter.session_id() == 200);
+    frame(true);
+    CHECK(frame_text.find("干员甲") == std::string::npos);
+    std::puts("PASS main seed / boss identity / shop counter tabs and player scope / session isolation");
+}
+
 void test_phase_membership() {
     setup_model();
     hit(8, BattlePhase::Assist, 70, 2);
@@ -312,8 +446,10 @@ int main() {
                                    io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
     unsigned char* pixels = nullptr; int width = 0, height = 0;
     io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    test_idle_window_before_session();
     test_selection_and_lifecycle();
     test_actual_buttons_and_layout();
+    test_match_identity_and_shop_counter_tabs();
     test_phase_membership();
     test_out_of_game_and_scrolling();
     ImGui::DestroyContext();

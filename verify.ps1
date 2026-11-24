@@ -68,7 +68,7 @@ function Invoke-Cl([string[]]$Arguments) {
     }
 }
 
-$TestNames = @('stronghold_model_tests', 'stronghold_csv_tests', 'stronghold_xlsx_tests', 'stronghold_report_tests', 'il2cpp_runtime_tests', 'stronghold_capture_tests', 'stronghold_schema_tests', 'metadata_report_tests', 'stronghold_ui_tests')
+$TestNames = @('stronghold_model_tests', 'stronghold_csv_tests', 'stronghold_xlsx_tests', 'stronghold_report_tests', 'il2cpp_runtime_tests', 'stronghold_capture_tests', 'stronghold_schema_tests', 'metadata_report_tests', 'shop_counter_tests', 'stronghold_ui_tests')
 foreach ($Name in $TestNames) {
     $Source = Join-Path $Root "tests\$Name.cpp"
     Write-Host "==== TEST $Name ===="

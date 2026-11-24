@@ -4,6 +4,7 @@
 
 #include "../stronghold/capture.cpp"
 #include "model.h"
+#include "shop_counter.h"
 
 namespace ark::stronghold {
 namespace mock {
@@ -18,6 +19,7 @@ Klass player_model_class{"AutoChessPlayerDataModel", 0}, player_card_class{"Play
 Klass indexer_class{"AutoChessDataIndexer", 0}, settle_class{"AutoChessSettleDataModel", 0};
 Klass controller_class{"BattleController", 0}, player_data_class{"BattlePlayerData", 0};
 Klass sequence_class{"MockSequence", 0};
+Klass shop_class{"AutoChessShopDataModel", 0}, shop_good_class{"ChessGoods", 0};
 Klass game_status_class{"AutoChessGameStatus", 0}, battle_status_class{"AutoChessBattleStatusDataModel", 0};
 Klass self_status_class{"Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.SelfBattleRoundStatus", 0};
 Klass self_status_ref_class{"Torappu.Battle.AutoChess.AutoChessBattleStatusDataModel.SelfBattleRoundStatus&", 0};
@@ -41,6 +43,9 @@ Field card_nickname{&string_class, 40}, card_nicknumber{&string_class, 41};
 Field manager_center{&center_class, 99};
 Field center_player_model{&player_model_class, 100}, center_indexer{&indexer_class, 101};
 Field center_settle{&settle_class, 102};
+Field center_shop{&shop_class, 103}, shop_goods{&sequence_class, 104};
+Field shop_chess_id{&string_class, 105}, shop_refresh_seq{&int32, 106};
+Field shop_bad_price{&int32, 107};
 Field indexer_inst_players{&dictionary, 110}, indexer_runtime_cards{&reference_dictionary, 111};
 Field indexer_token_cards{&dictionary, 112};
 Field battle_characters{&sequence_class, 50}, battle_tokens{&sequence_class, 51};
@@ -113,6 +118,7 @@ struct DataCenter {
     int stage_seed = 9001;
     int round = 0;
     int self = 1;
+    void* shop = nullptr;
 } live_center;
 struct PlayerModel {
     Klass* klass = &player_model_class;
@@ -130,6 +136,8 @@ struct Settle {
 } live_settle;
 struct Controller { Klass* klass = &controller_class; int state = 2; } live_controller;
 struct Sequence { Klass* klass = &sequence_class; std::vector<void*> items; };
+struct Shop { Klass* klass = &shop_class; Sequence goods; int refresh_seq = 0; };
+struct ShopGood { Klass* klass = &shop_good_class; String id; };
 struct PlayerData { Klass* klass = &player_data_class; Sequence characters; Sequence tokens; int side = 0; };
 struct GameStatus { Klass* klass = &game_status_class; int state = 3; } live_game_status;
 struct SelfRoundStatus { Klass* klass = &self_status_class; bool finished = false; };
@@ -334,6 +342,8 @@ il2cpp::Runtime runtime() {
     r.field_type = [](void* f) -> void* { return static_cast<Field*>(f)->type; };
     r.field_get = [](void* object, void* field, void* out) {
         const auto index = static_cast<Field*>(field)->index;
+        if (index == 106) { *static_cast<int*>(out) = static_cast<Shop*>(object)->refresh_seq; return; }
+        if (index == 107) throw std::runtime_error("Optional price unavailable");
         if (index == 52) { *static_cast<int*>(out) = static_cast<PlayerData*>(object)->side; return; }
         if (index == 30) {
             *static_cast<int*>(out) = static_cast<Controller*>(object)->state;
@@ -373,6 +383,9 @@ il2cpp::Runtime runtime() {
         if (index == 100) return static_cast<DataCenter*>(object)->player_model;
         if (index == 101) return static_cast<DataCenter*>(object)->indexer;
         if (index == 102) return static_cast<DataCenter*>(object)->settle;
+        if (index == 103) return static_cast<DataCenter*>(object)->shop;
+        if (index == 104) return &static_cast<Shop*>(object)->goods;
+        if (index == 105) return &static_cast<ShopGood*>(object)->id;
         if (index == 110) return static_cast<Indexer*>(object)->inst_players;
         if (index == 111) return static_cast<Indexer*>(object)->runtime_cards;
         if (index == 112) return static_cast<Indexer*>(object)->token_cards;
@@ -521,6 +534,362 @@ struct CaptureTests {
         int count = 0;
         for (const Event& event : events) if (event.kind == kind) ++count;
         return count;
+    }
+
+    static int match_intel_snapshot_contract() {
+        int failures = 0;
+        const auto expect = [&](bool condition, const char* expression, int line) {
+            if (!condition) {
+                ++failures;
+                std::fprintf(stderr, "FAIL match intel %d: %s\n", line, expression);
+            }
+        };
+
+        clear_match_intel();
+        ArkPluginApiV1 api{};
+        NativeCapture capture(api);
+        capture.session_id_ = 41;
+        capture.current_round_ = 3;
+
+        std::vector<PlayerInfo> players(1);
+        players[0].index = 2;
+        players[0].uid = "private-test-UID";
+        players[0].name = "private-test-nickname";
+        players[0].band_id = "test-band";
+        players[0].band_available = true;
+        players[0].squad_available = true;
+        players[0].shop_level = 4;
+        players[0].shop_level_available = true;
+        players[0].shop_coin = 12;
+        players[0].shop_coin_available = true;
+        IntelSquadSlot slot;
+        slot.char_id = "test-char";
+        slot.chess_id = "test-chess";
+        slot.potential_rank = 3;
+        slot.bond_ids = {"test-bond"};
+        players[0].squad_slots.push_back(slot);
+
+        capture.refresh_match_intel(nullptr, players, 123456);
+        auto snapshot = capture_match_intel();
+        expect(snapshot.session_id == 41 && snapshot.round == 3 && snapshot.stage_seed == 123456,
+               "snapshot copies session/round/seed", __LINE__);
+        expect(snapshot.players.size() == 1 && snapshot.players[0].index == 2,
+               "snapshot copies player index", __LINE__);
+        expect(snapshot.players[0].name == "private-test-nickname" &&
+                   snapshot.players[0].band_id == "test-band",
+               "snapshot copies display/static info", __LINE__);
+        expect(snapshot.players[0].squad_slots.size() == 1 &&
+                   snapshot.players[0].squad_slots[0].char_id == "test-char",
+               "snapshot copies initial squad", __LINE__);
+        expect(snapshot.players[0].shop_level == 4 && snapshot.players[0].shop_coin == 12,
+               "snapshot copies per-player shop summary", __LINE__);
+
+        auto copy = snapshot;
+        copy.stage_id = "mutated-copy";
+        auto fresh = capture_match_intel();
+        expect(fresh.stage_id != "mutated-copy", "capture returns an independent copy", __LINE__);
+        clear_match_intel();
+        expect(!capture_match_intel().available, "clear resets published snapshot", __LINE__);
+        return failures;
+    }
+
+    static int hidden_sync_snapshot_contract() {
+        int failures = 0;
+        const auto expect = [&](bool condition, const char* expression, int line) {
+            if (!condition) {
+                ++failures;
+                std::fprintf(stderr, "FAIL hidden sync %d: %s\n", line, expression);
+            }
+        };
+
+        clear_hidden_sync();
+        HiddenSyncSnapshot input;
+        input.available = true;
+        input.stage_seed = 123456;
+        input.stage_seed_available = true;
+        input.hidden_boss_id = "hidden-boss";
+        input.hidden_boss_available = true;
+        IntelHiddenPlayer player;
+        player.index = 2;
+        player.banned_units_available = true;
+        player.banned_units.push_back({"hidden-bond", {7, 8}});
+        player.store.available = true;
+        player.store.level = 4;
+        player.store.coin = 19;
+        IntelShopGood good;
+        good.slot_id = 3;
+        good.price = 5;
+        good.frozen = true;
+        good.chess_identifier = 77;
+        player.store.goods.push_back(good);
+        input.players.push_back(player);
+        publish_hidden_sync(input);
+
+        const auto snapshot = capture_hidden_sync();
+        expect(snapshot.available && snapshot.sequence == 1 && snapshot.stage_seed == 123456,
+               "hidden snapshot copies availability/sequence/seed", __LINE__);
+        expect(snapshot.players.size() == 1 && snapshot.players[0].index == 2,
+               "hidden snapshot copies player index", __LINE__);
+        expect(snapshot.players[0].banned_units.size() == 1 &&
+                   snapshot.players[0].banned_units[0].bond_id == "hidden-bond",
+               "hidden snapshot copies all-player banned units", __LINE__);
+        expect(snapshot.players[0].store.goods.size() == 1 &&
+                   snapshot.players[0].store.goods[0].chess_identifier == 77,
+               "hidden snapshot copies full player store/identifier", __LINE__);
+        auto copy = snapshot;
+        copy.hidden_boss_id = "mutated";
+        expect(capture_hidden_sync().hidden_boss_id == "hidden-boss",
+               "hidden snapshot is an independent copy", __LINE__);
+        clear_hidden_sync();
+        expect(!capture_hidden_sync().available, "hidden snapshot clear resets state", __LINE__);
+        return failures;
+    }
+
+    static bool local_shop_reaches_counter() {
+        using namespace mock;
+        ArkPluginApiV1 api{};
+        NativeCapture capture(api);
+        capture.runtime_ = runtime();
+        capture.center_shop_model_field_ = &center_shop;
+        capture.shop_goods_field_ = &shop_goods;
+        capture.shop_goods_class_ = &shop_good_class;
+        capture.shop_good_chess_id_field_ = &shop_chess_id;
+        capture.shop_good_price_field_ = &shop_bad_price;
+        capture.self_index_ = 1;
+        capture.current_round_ = 3;
+        capture.session_id_ = 42;
+        capture.shop_session_id_.store(42);
+        reset_shop_observations(42);
+
+        Shop shop;
+        ShopGood a, b;
+        a.id.value = L"char-a";
+        b.id.value = L"char-b";
+        DataCenter center;
+        center.shop = &shop;
+        ShopCounter counter;
+        const auto sample = [&](ShopGood& good) {
+            shop.goods.items = {&good};
+            capture.refresh_match_intel(&center, {}, 123456);
+            for (const auto& observed : drain_shop_observations().observations)
+                counter.apply(observed);
+        };
+
+        sample(a);
+        sample(a);
+        sample(b);
+        auto rows = counter.frequencies(false, 1);
+        const bool fallback = rows.size() == 2 && rows[0].total == 1 && rows[1].total == 1 &&
+            counter.incomplete();
+
+        capture.shop_refresh_seq_field_ = &shop_refresh_seq;
+        counter.reset(42);
+        sample(a);
+        ++shop.refresh_seq;
+        sample(a);
+        rows = counter.frequencies(false, 1);
+        reset_shop_observations(0);
+        clear_match_intel();
+        return fallback && rows.size() == 1 && rows[0].total == 2;
+    }
+
+    static bool shop_catalog_resolves_protocol_names() {
+        using namespace mock;
+        static Klass act_type{"Torappu.ActAutoChessData", 0};
+        static Klass row_type{"Torappu.ActAutoChessData.ActAutoChessCharChessData", 0};
+        static Klass table_type{"Torappu.ListDict<System.String,Torappu.ActAutoChessData.ActAutoChessCharChessData>", 0};
+        static Klass pair_type{"System.Collections.Generic.KeyValuePair<System.String,Torappu.ActAutoChessData.ActAutoChessCharChessData>", 16};
+        static Klass list_type{"System.Collections.Generic.List<System.String>", 0};
+        static Klass bond_type{"Torappu.ActAutoChessData.ActAutoChessBondInfo", 0};
+        static Klass bond_ref_type{"Torappu.ActAutoChessData.ActAutoChessBondInfo&", 0};
+        static Klass bond_table_type{"Torappu.ListDict<System.String,Torappu.ActAutoChessData.ActAutoChessBondInfo>", 0};
+        static Klass string_type{"System.String", 0};
+        static Field table_field{&table_type, 0, "charChessDataDict"};
+        static Field bond_table_field{&bond_table_type, 0, "bondInfoDict"};
+        static Field bond_name_field{&string_type, 0, "name"};
+        static Field value_field{&row_type, 1, "value"};
+        static Field identifier_field{&int32, 2, "identifier"};
+        static Field id_field{&string_type, 3, "chessId"};
+        static Field bonds_field{&list_type, 4, "bondIds"};
+        static Method get_act{reinterpret_cast<void*>(1), 0, false, "get_actData", &center_class, &act_type};
+        static Method get_pair{reinterpret_cast<void*>(1), 1, false, "Get", &table_type, &pair_type, {&int32}};
+        static Method get_name{reinterpret_cast<void*>(1), 1, true, "GetCharName", &act_type, &string_type, {&string_type}};
+        static Method find_bond{reinterpret_cast<void*>(1), 2, false, "TryGetValue", &bond_table_type, &boolean, {&string_type, &bond_ref_type}};
+        static String char_id{&string_class, L"char_catalog"};
+        static String char_name{&string_class, L"示例干员"};
+        static String bond_id{&string_class, L"bond_catalog"};
+        static String bond_name{&string_class, L"示例盟约"};
+        Sequence bond_list{&sequence_class, {&bond_id}};
+        struct Reference { Klass* klass; void* value; };
+        struct Activity { Klass* klass; void* chars; void* bonds; };
+        static Reference bond{&bond_type, &bond_name};
+        Reference row{&row_type, &bond_list};
+        Reference pair{&pair_type, &row};
+        Sequence table{&table_type, {&pair}};
+        Reference bond_table{&bond_table_type, &bond};
+        Activity act{&act_type, &table, &bond_table};
+        Reference center{&center_class, &act};
+        ArkPluginApiV1 api{};
+        NativeCapture capture(api);
+        auto& rt = capture.runtime_;
+        rt = runtime();
+        field_registry[&act_type] = {&table_field, &bond_table_field};
+        field_registry[&bond_type] = {&bond_name_field};
+        field_registry[&pair_type] = {&value_field};
+        field_registry[&row_type] = {&identifier_field, &id_field, &bonds_field};
+        method_registry[&table_type] = {&get_count, &get_pair};
+        method_registry[&bond_table_type] = {&find_bond};
+        rt.field_get_object = [](void* field, void* object) -> void* {
+            if (field == &id_field) return &char_id;
+            if (field == &table_field) return static_cast<Activity*>(object)->chars;
+            if (field == &bond_table_field) return static_cast<Activity*>(object)->bonds;
+            return static_cast<Reference*>(object)->value;
+        };
+        rt.field_get = [](void*, void*, void* out) { *static_cast<int*>(out) = 252; };
+        const auto invoke = rt.invoke_method;
+        // A real IL2CPP reference parameter is passed directly in params[0].
+        rt.invoke_method = [](void* method, void* receiver, void** args, void**) -> void* {
+            if (method == &get_act) return static_cast<Reference*>(receiver)->value;
+            if (method == &get_name) return args[0] == &char_id ? &char_name : nullptr;
+            if (method == &find_bond) {
+                bool_box.value = args[0] == &bond_id;
+                *static_cast<void**>(args[1]) = bool_box.value ? static_cast<Reference*>(receiver)->value : nullptr;
+                return &bool_box;
+            }
+            if (method == &get_count) {
+                int_box.value = static_cast<int>(static_cast<Sequence*>(receiver)->items.size());
+                return &int_box;
+            }
+            return static_cast<Sequence*>(receiver)->items.at(*static_cast<int*>(args[0]));
+        };
+        capture.center_act_data_info_ = &get_act;
+        capture.character_name_lookup_ = &get_name;
+        capture.refresh_shop_catalog(&center);
+        const auto protocol = capture.describe_chess(252, 3);
+        const auto local = capture.shop_catalog_entry(0, "char_catalog");
+        const auto unknown = capture.describe_chess(12, 1);
+        rt.invoke_method = invoke;
+        field_registry.erase(&act_type);
+        field_registry.erase(&bond_type);
+        field_registry.erase(&pair_type);
+        field_registry.erase(&row_type);
+        method_registry.erase(&table_type);
+        method_registry.erase(&bond_table_type);
+        return protocol.operator_name == "示例干员" && protocol.chess_id == "char_catalog" &&
+            protocol.count == 3 && protocol.bond_ids == std::vector<std::string>{"bond_catalog"} &&
+            protocol.bond_names == std::vector<std::string>{"示例盟约"} &&
+            local.operator_name == protocol.operator_name && unknown.operator_name.empty();
+    }
+
+    static bool boss_name_uses_game_data_and_enemy_handbook() {
+        using namespace mock;
+        static Klass game_type{"Torappu.AutoChessData", 0};
+        static Klass boss_type{"Torappu.AutoChessData.AutoChessBossInfoData", 0};
+        static Klass boss_out{"Torappu.AutoChessData.AutoChessBossInfoData&", 0};
+        static Klass boss_dict{"System.Collections.Generic.Dictionary<System.String,Torappu.AutoChessData.AutoChessBossInfoData>", 0};
+        static Klass handbook_type{"Torappu.EnemyHandBookDataGroup", 0};
+        static Klass enemy_type{"Torappu.EnemyHandBookData", 0};
+        static Klass enemy_out{"Torappu.EnemyHandBookData&", 0};
+        static Klass enemy_dict{"System.Collections.Generic.Dictionary<System.String,Torappu.EnemyHandBookData>", 0};
+        static Klass keys_type{"BossKeys", 0}, enumerator_type{"BossKeysEnumerator", 0};
+        static Klass string_type{"System.String", 0};
+        static Field game_field{&game_type, 0, "gameData"};
+        static Field boss_field{&boss_dict, 0, "bossInfoDict"};
+        static Field entries_field{&enemy_dict, 0, "enemyData"};
+        static Field enemy_id_field{&string_type, 0, "enemyId"};
+        static Field handbook_id_field{&string_type, 1, "handbookEnemyId"};
+        static Field name_field{&string_type, 0, "name"};
+        static Method hidden_id{reinterpret_cast<void*>(1), 0, false, "get_hiddenBossId", &center_class, &string_type};
+        static Method handbook_data{reinterpret_cast<void*>(1), 0, true, "get_data", &handbook_type, &handbook_type};
+        static Method find_boss{reinterpret_cast<void*>(1), 2, false, "TryGetValue", &boss_dict, &boolean, {&string_type, &boss_out}};
+        static Method find_enemy{reinterpret_cast<void*>(1), 2, false, "TryGetValue", &enemy_dict, &boolean, {&string_type, &enemy_out}};
+        static Method get_keys{reinterpret_cast<void*>(1), 0, false, "get_Keys", &boss_dict, &keys_type};
+        static Method get_enum{reinterpret_cast<void*>(1), 0, false, "GetEnumerator", &keys_type, &enumerator_type};
+        static Method next_key{reinterpret_cast<void*>(1), 0, false, "MoveNext", &enumerator_type, &boolean};
+        static Method current_key{reinterpret_cast<void*>(1), 0, false, "get_Current", &enumerator_type, &string_type};
+        static String boss_id{&string_class, L"boss_16"};
+        static String enemy_id{&string_class, L"enemy_boss_variant"};
+        static String handbook_id{&string_class, L"enemy_boss_handbook"};
+        static String name{&string_class, L"示例首领"};
+        struct Reference { Klass* klass; void* first; void* second = nullptr; };
+        static Reference enemy{&enemy_type, &name};
+        static Reference enemies{&enemy_dict, &enemy};
+        static Reference handbook{&handbook_type, &enemies};
+        static Reference boss{&boss_type, &enemy_id, &handbook_id};
+        static Reference enumerator{&enumerator_type, &boss_id};
+        static Reference keys{&keys_type, &enumerator};
+        Reference bosses{&boss_dict, &boss, &keys};
+        Reference game{&game_type, &bosses};
+        Reference center{&center_class, &game, &boss_id};
+        ArkPluginApiV1 api{};
+        NativeCapture capture(api);
+        auto& rt = capture.runtime_;
+        rt = runtime();
+        field_registry[&game_type] = {&boss_field};
+        field_registry[&handbook_type] = {&entries_field};
+        field_registry[&boss_type] = {&enemy_id_field, &handbook_id_field};
+        field_registry[&enemy_type] = {&name_field};
+        method_registry[&boss_dict] = {&find_boss, &get_keys};
+        method_registry[&enemy_dict] = {&find_enemy};
+        method_registry[&keys_type] = {&get_enum};
+        method_registry[&enumerator_type] = {&next_key, &current_key};
+        rt.field_get_object = [](void* field, void* object) -> void* {
+            return field == &handbook_id_field ? static_cast<Reference*>(object)->second
+                                              : static_cast<Reference*>(object)->first;
+        };
+        rt.invoke_method = [](void* method, void* receiver, void** args, void**) -> void* {
+            if (method == &handbook_data) return &handbook;
+            auto* object = static_cast<Reference*>(receiver);
+            if (method == &hidden_id || method == &get_keys) return object->second;
+            if (method == &get_enum || method == &current_key) return object->first;
+            if (method == &next_key) {
+                bool_box.value = object->second == nullptr;
+                object->second = object->first;
+                return &bool_box;
+            }
+            // Enforce the IL2CPP string reference/in and managed reference/out ABI.
+            bool_box.value = method == &find_boss ? args[0] == &boss_id : args[0] == &handbook_id;
+            *static_cast<void**>(args[1]) = bool_box.value ? object->first : nullptr;
+            return &bool_box;
+        };
+        capture.session_id_ = 55;
+        capture.center_hidden_boss_id_info_ = &hidden_id;
+        capture.center_game_data_field_ = &game_field;
+        capture.enemy_handbook_data_info_ = &handbook_data;
+        clear_hidden_sync();
+        capture.refresh_match_intel(&center, {}, 0);
+        const auto local = capture_match_intel();
+
+        center.second = nullptr;
+        HiddenSyncSnapshot sync;
+        sync.available = true;
+        sync.session_id = 55;
+        sync.hidden_boss_available = true;
+        sync.hidden_boss_id = "boss_16";
+        publish_hidden_sync(sync);
+        enumerator.second = nullptr;
+        capture.refresh_match_intel(&center, {}, 0);
+        const auto synced = capture_match_intel();
+
+        sync.hidden_boss_id = "boss_missing";
+        publish_hidden_sync(sync);
+        enumerator.second = nullptr;
+        capture.refresh_match_intel(&center, {}, 0);
+        const auto missing = capture_match_intel();
+        clear_hidden_sync();
+        clear_match_intel();
+        field_registry.erase(&game_type);
+        field_registry.erase(&handbook_type);
+        field_registry.erase(&boss_type);
+        field_registry.erase(&enemy_type);
+        method_registry.erase(&boss_dict);
+        method_registry.erase(&enemy_dict);
+        method_registry.erase(&keys_type);
+        method_registry.erase(&enumerator_type);
+        return local.hidden_boss_id == "boss_16" && local.hidden_boss_name_available &&
+            local.hidden_boss_name == "示例首领" && synced.hidden_boss_id == "boss_16" &&
+            synced.hidden_boss_name_available && synced.hidden_boss_name == local.hidden_boss_name &&
+            missing.hidden_boss_id == "boss_missing" && !missing.hidden_boss_name_available;
     }
 
     static int full_tick_runtime_contract() {
@@ -1262,6 +1631,11 @@ struct CaptureTests {
 
         int failures = 0;
 #define EXPECT(value) do { if (!(value)) { ++failures; std::fprintf(stderr, "FAIL capture %d: %s\n", __LINE__, #value); } } while (0)
+        failures += match_intel_snapshot_contract();
+        failures += hidden_sync_snapshot_contract();
+        EXPECT(local_shop_reaches_counter());
+        EXPECT(shop_catalog_resolves_protocol_names());
+        EXPECT(boss_name_uses_game_data_and_enemy_handbook());
         ArkPluginApiV1 api{};
         NativeCapture capture(api);
         capture.runtime_ = mock::runtime();
