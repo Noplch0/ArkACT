@@ -47,7 +47,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $tagged -ne (git rev-parse HEAD)) { throw 'Tag must point to the build commit.' }
       - name: Prepare pinned Zig and matching ArkImGui
         run: ./tools/prepare-dependencies.ps1
-      - name: Run nine test suites and seven production compile checks
+      - name: Run ten test suites and seven production compile checks
         run: |
           Start-Transcript -Path .build/verify-ci.log
           try {

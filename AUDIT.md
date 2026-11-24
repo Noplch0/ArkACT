@@ -1,9 +1,13 @@
-# 1.2.0 版本发布准备（2026-11-24）
+# 1.2.0 正式发布与 Latest 核验（2026-11-24）
 
 - 当前源码版本常量由 1.1.1 提升为 1.2.0，纳入此前未发布的种子/Boss 主界面、商店记牌器，以及干员/盟约名称、跨回合冻结去重、单玩家频率和隐藏 Boss 名称修复。历史 1.1.1 审计记录保留。
 - `verify.ps1` 十组 MSVC 回归和七个生产编译单元通过；独立 XLSX 校验器七项测试及生成工作簿夹具检查通过。
 - Zig 0.17.0 构建成功；`inspect_binary.py` 实际加载 DLL query 版本 1.2.0，确认零前置插件依赖，禁用写入/对象创建能力扫描通过。项目内 DLL 为 1,566,208 字节，SHA256 `0442A4B0A609471A8E89C47879D280A3F0AB82AFEDEA669D892BC6C357C8136A`。
-- 本次未部署、重载、操作游戏或创建 GitHub Release；Boss 名称映射、记牌器联机覆盖和实际 Hook 覆盖仍待实机复测。
+- 创建附注标签 `v1.2.0`（标签对象 `fbcb2ec0d7a1ef22c8ac918588c8446fe2a442e6`）并推送到构建 commit `a3f4b4c284695356889eace5edd01fe7875c25d3`。Actions **45319944915** 在 4 分 30 秒内成功，由标签自动构建并发布，没有手工创建 Release。
+- GitHub Release 公开地址为 https://github.com/Noplch0/ArkACT/releases/tag/v1.2.0 ，draft=false、prerelease=false，Latest API 指向 v1.2.0；两个预期附件状态均为 uploaded。
+- 首次自动发布的工作流正文沿用了 `.github/RELEASE_NOTES.md` 中旧的 1.0.1 模板。已将该模板更新为 1.2.0 并修正当前 Release 正文；没有替换已验证的 ZIP/DLL 附件。
+- 重新下载正式附件核验：ZIP 683,318 字节，SHA256 `629EC616D8FC97381926B47254545AA623B769ADDE6B5CBC4419158C4E5269B3`，与同名校验文件一致；允许清单、构建信息与 DLL 查询通过。CI DLL 为 1,566,208 字节，SHA256 `9DB35739C4585DAF85817355D97CCDECFA4AD9B98CCF35D6160614D42F918378`。
+- 本次未部署、重载或操作游戏；Boss 名称映射、记牌器联机覆盖和实际 Hook 覆盖仍待实机复测。
 # 1.1.1 修复隐藏 Boss 名称显示（2026-11-23）
 
 - 本地元数据显示活动 Boss 条目只有 ID、排序、权重、血量配置和隐藏标志。客户端 Boss UI 通过 `AutoChessDataCenter.gameData.bossInfoDict` 映射敌人 ID，并从 `EnemyHandBookDB` 的图鉴条目读取名称。修复将名称查询接入这条路径，并修正托管字符串入参的传法。

@@ -1,7 +1,7 @@
 # 卫戍协议 Seed 与怪物生成机制
 
 > 文档基线：2026-11-24
-> 相关插件版本：1.2.0（本地构建，未发布）
+> 相关插件版本：1.2.0（已发布）
 > 客户端证据：`reference/current-schema/stronghold-schema-4708.log`、`.build/analysis-2.0.7-methods.tsv`、`.build/shop-analysis-2026-11-22/`、`reference/dump-audit/`
 > 性质：静态分析记录，不是实机网络验证，也不是玩法修改或自动化实现说明。
 
